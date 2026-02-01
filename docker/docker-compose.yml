@@ -1,0 +1,118 @@
+version: '3.8'
+
+services:
+  # Chord DHT Nodes
+  chord-node-0:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["--node-id", "0", "--protocol", "chord", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    networks:
+      - dht-network
+    hostname: chord-node-0
+
+  chord-node-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["--node-id", "50", "--protocol", "chord", "--port", "8000"]
+    ports:
+      - "8001:8000"
+    networks:
+      - dht-network
+    hostname: chord-node-1
+
+  chord-node-2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["--node-id", "100", "--protocol", "chord", "--port", "8000"]
+    ports:
+      - "8002:8000"
+    networks:
+      - dht-network
+    hostname: chord-node-2
+
+  chord-node-3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["--node-id", "150", "--protocol", "chord", "--port", "8000"]
+    ports:
+      - "8003:8000"
+    networks:
+      - dht-network
+    hostname: chord-node-3
+
+  chord-node-4:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["--node-id", "200", "--protocol", "chord", "--port", "8000"]
+    ports:
+      - "8004:8000"
+    networks:
+      - dht-network
+    hostname: chord-node-4
+
+  # Pastry DHT Nodes
+  pastry-node-0:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["--node-id", "0", "--protocol", "pastry", "--port", "8000"]
+    ports:
+      - "9000:8000"
+    networks:
+      - dht-network
+    hostname: pastry-node-0
+
+  pastry-node-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["--node-id", "50", "--protocol", "pastry", "--port", "8000"]
+    ports:
+      - "9001:8000"
+    networks:
+      - dht-network
+    hostname: pastry-node-1
+
+  pastry-node-2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["--node-id", "100", "--protocol", "pastry", "--port", "8000"]
+    ports:
+      - "9002:8000"
+    networks:
+      - dht-network
+    hostname: pastry-node-2
+
+  pastry-node-3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["--node-id", "150", "--protocol", "pastry", "--port", "8000"]
+    ports:
+      - "9003:8000"
+    networks:
+      - dht-network
+    hostname: pastry-node-3
+
+  pastry-node-4:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["--node-id", "200", "--protocol", "pastry", "--port", "8000"]
+    ports:
+      - "9004:8000"
+    networks:
+      - dht-network
+    hostname: pastry-node-4
+
+networks:
+  dht-network:
+    driver: bridge
