@@ -15,7 +15,19 @@ This implementation supports **both simulated and real distributed environments*
 - Real distributed deployment with Docker & Kubernetes
 - HTTP/REST communication between nodes
 - Production-like environment
-- See **DISTRIBUTED_QUICKSTART.md** to get started
+- See sections below for Docker and Kubernetes setup
+
+### Deployment Comparison
+
+| Feature | Simulated | Docker | Kubernetes |
+|---------|-----------|--------|------------|
+| **Network** | In-process | Real HTTP | Real HTTP |
+| **Setup** | Quick | Easy | Moderate |
+| **Latency** | ~0ms | 1-10ms | 1-50ms |
+| **Isolation** | None | Container | Container + Orchestration |
+| **Scaling** | Limited by RAM | Manual | Automatic |
+| **Use Case** | Development | Testing | Production-like |
+| **Command** | `python main.py --test` | `./scripts/deploy-docker.sh chord` | `./scripts/deploy-k8s.sh chord` |
 
 ## Project Overview
 
@@ -78,8 +90,19 @@ decentralised-data/
 ## Installation
 
 ### Prerequisites
+
+**For Simulated Mode:**
 - Python 3.8 or higher
 - pip package manager
+
+**For Distributed Mode (Docker):**
+- Docker and Docker Compose
+- Python 3.8+ (for orchestrator)
+
+**For Distributed Mode (Kubernetes):**
+- Kubernetes (minikube for local development)
+- kubectl CLI tool
+- Docker
 
 ### Setup
 
@@ -96,6 +119,17 @@ pip install -r requirements.txt
 3. (Optional) Download the movies dataset:
    - Download from: https://www.kaggle.com/datasets/mustafasayed1181/movies-metadata-cleaned-dataset-19002025
    - Place `movies_dataset.csv` in the `data/` directory
+
+### What are Docker and Kubernetes?
+
+**Docker** is a platform that packages your application and its dependencies into containers - lightweight, portable units that run consistently across different environments. Think of it as shipping your entire development environment in a box.
+
+**Kubernetes (k8s)** is a container orchestration platform that manages Docker containers at scale. It automatically handles deployment, scaling, load balancing, and self-healing of containerized applications across multiple machines.
+
+**Why use them for this project?**
+- **Docker**: Run each DHT node in its own isolated container with real network communication (instead of simulated)
+- **Kubernetes**: Deploy and manage many DHT nodes easily, with automatic scaling and monitoring
+- **Real distributed testing**: Experience how distributed systems work in production environments
 
 ## Usage
 
@@ -158,6 +192,243 @@ If you already have results and want to regenerate plots:
 
 ```bash
 python main.py --plot-only results/experiment_results.csv
+```
+
+## Docker Deployment
+
+Docker allows you to run your DHT nodes in isolated containers with real HTTP communication between nodes.
+
+### Quick Start with Docker
+
+**1. Install Docker:**
+
+Linux (Ubuntu/Debian):
+```bash
+sudo apt-get update
+sudo apt-get install docker.io docker-compose
+sudo usermod -aG docker $USER  # Add yourself to docker group
+newgrp docker  # Refresh group membership
+```
+
+macOS/Windows: Download Docker Desktop from https://www.docker.com/products/docker-desktop
+
+**2. Build the Docker image:**
+
+```bash
+./scripts/build.sh
+```
+
+Or manually:
+```bash
+docker build -t dht-node:latest -f docker/Dockerfile .
+```
+
+**3. Deploy DHT nodes using Docker Compose:**
+
+Start 5 Chord nodes (ports 8000-8004):
+```bash
+./scripts/deploy-docker.sh chord
+```
+
+Start 5 Pastry nodes (ports 9000-9004):
+```bash
+./scripts/deploy-docker.sh pastry
+```
+
+Or manually with docker-compose:
+```bash
+# Start Chord nodes
+docker compose -f docker/docker-compose.yml up -d chord-node-0 chord-node-1 chord-node-2 chord-node-3 chord-node-4
+
+# Start Pastry nodes
+docker compose -f docker/docker-compose.yml up -d pastry-node-0 pastry-node-1 pastry-node-2 pastry-node-3 pastry-node-4
+```
+
+**4. Verify nodes are running:**
+
+```bash
+# Check running containers
+docker ps
+
+# Test health endpoints
+curl http://localhost:8000/health
+curl http://localhost:8001/health
+```
+
+**5. Run an experiment:**
+
+```bash
+python distributed/orchestrator.py \
+    --protocol chord \
+    --deployment docker \
+    --num-nodes 5 \
+    --num-items 500
+```
+
+**6. View logs:**
+
+```bash
+# View all logs
+docker compose -f docker/docker-compose.yml logs -f
+
+# View specific node
+docker compose -f docker/docker-compose.yml logs -f chord-node-0
+```
+
+**7. Stop the deployment:**
+
+```bash
+docker compose -f docker/docker-compose.yml down
+```
+
+### Docker Commands Reference
+
+```bash
+# List running containers
+docker ps
+
+# Stop all containers
+docker compose -f docker/docker-compose.yml down
+
+# Rebuild and restart
+docker compose -f docker/docker-compose.yml up -d --build
+
+# Remove all stopped containers
+docker container prune
+
+# View resource usage
+docker stats
+```
+
+## Kubernetes Deployment
+
+Kubernetes provides production-grade orchestration for running many DHT nodes with automatic scaling and self-healing.
+
+### Quick Start with Kubernetes
+
+**1. Install Minikube and kubectl:**
+
+Linux:
+```bash
+# Install Minikube
+curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+sudo install minikube-linux-amd64 /usr/local/bin/minikube
+
+# Install kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+```
+
+macOS:
+```bash
+brew install minikube kubectl
+```
+
+Windows: Download from https://minikube.sigs.k8s.io/docs/start/
+
+**2. Start Minikube:**
+
+```bash
+minikube start
+```
+
+**3. Build image in Minikube's Docker:**
+
+```bash
+# Point to Minikube's Docker
+eval $(minikube docker-env)
+
+# Build the image
+./scripts/build.sh
+```
+
+**4. Deploy to Kubernetes:**
+
+Deploy Chord:
+```bash
+./scripts/deploy-k8s.sh chord
+```
+
+Deploy Pastry:
+```bash
+./scripts/deploy-k8s.sh pastry
+```
+
+Or manually:
+```bash
+kubectl apply -f k8s/namespace.yaml
+kubectl apply -f k8s/chord-statefulset.yaml
+```
+
+**5. Check pod status:**
+
+```bash
+kubectl get pods -n dht-system
+```
+
+**6. Access a node (port forwarding):**
+
+```bash
+# Forward chord-node-0 to localhost:8000
+kubectl port-forward -n dht-system chord-node-0 8000:8000
+
+# In another terminal, test it
+curl http://localhost:8000/health
+```
+
+**7. View logs:**
+
+```bash
+# Logs from specific pod
+kubectl logs -n dht-system chord-node-0 -f
+
+# Logs from all pods
+kubectl logs -n dht-system -l app=chord-node
+```
+
+**8. Scale deployment:**
+
+```bash
+# Scale to 10 nodes
+kubectl scale statefulset chord-node -n dht-system --replicas=10
+```
+
+**9. Cleanup:**
+
+```bash
+# Delete deployment
+kubectl delete -f k8s/chord-statefulset.yaml
+
+# Or delete entire namespace
+kubectl delete namespace dht-system
+
+# Stop Minikube
+minikube stop
+```
+
+### Kubernetes Commands Reference
+
+```bash
+# List all pods
+kubectl get pods -n dht-system
+
+# Describe pod (see errors)
+kubectl describe pod chord-node-0 -n dht-system
+
+# View logs
+kubectl logs -n dht-system chord-node-0 -f
+
+# Execute command in pod
+kubectl exec -it chord-node-0 -n dht-system -- bash
+
+# Scale statefulset
+kubectl scale statefulset chord-node -n dht-system --replicas=10
+
+# List services
+kubectl get services -n dht-system
+
+# Port forward
+kubectl port-forward -n dht-system chord-node-0 8000:8000
 ```
 
 ## Command-Line Options
@@ -229,22 +500,12 @@ The CSV file contains:
 ### Limitations
 
 This is an educational implementation with some simplifications:
-- Simulated network (not real sockets/distributed deployment)
+- **Simulated mode**: Uses in-process communication (but see Docker/Kubernetes deployment for real distributed networking)
 - Simplified node join/leave (rebuilds routing structures globally)
 - No network failures or Byzantine nodes
 - No replication or fault tolerance
 
-## Extension Ideas
-
-If you want to extend this project:
-
-1. **Real Network**: Replace simulator with socket-based communication
-2. **Docker/Kubernetes**: Deploy nodes as containers
-3. **Replication**: Add data replication for fault tolerance
-4. **Range Queries**: Extend B+ tree for range queries on popularity/rating
-5. **Load Balancing**: Implement virtual nodes for better load distribution
-6. **Failure Handling**: Add node failure detection and recovery
-7. **More DHTs**: Implement Kademlia, CAN, or other DHT protocols
+**Note**: The Docker and Kubernetes deployment modes address the first limitation by providing real HTTP-based network communication between nodes running in separate containers.
 
 ## Dataset Information
 
@@ -286,7 +547,69 @@ pip install matplotlib
 python main.py --experiment scalability --no-plots
 ```
 
-## Project Timeline
+### Docker Troubleshooting
+
+**"Cannot connect to Docker daemon":**
+```bash
+# Check if Docker is running
+sudo systemctl status docker
+
+# Start Docker
+sudo systemctl start docker
+```
+
+**"Port already in use":**
+```bash
+# Find what's using the port
+lsof -i :8000
+
+# Kill the process or change ports in docker-compose.yml
+```
+
+**"Permission denied" (Linux):**
+```bash
+# Add your user to docker group
+sudo usermod -aG docker $USER
+newgrp docker
+```
+
+**Container keeps restarting:**
+```bash
+# Check logs for errors
+docker compose -f docker/docker-compose.yml logs chord-node-0
+```
+
+### Kubernetes Troubleshooting
+
+**Pods stuck in "Pending":**
+```bash
+# Check what's wrong
+kubectl describe pod chord-node-0 -n dht-system
+```
+
+**"ImagePullBackOff" error:**
+```bash
+# Build image in Minikube's Docker
+eval $(minikube docker-env)
+./scripts/build.sh
+
+# Make sure imagePullPolicy is set to Never in YAML
+```
+
+**Can't access pods:**
+```bash
+# Use port forwarding
+kubectl port-forward -n dht-system chord-node-0 8000:8000
+```
+
+**Minikube not starting:**
+```bash
+# Delete and restart
+minikube delete
+minikube start
+```
+
+## Project Features
 
 This implementation includes:
 - ✅ Chord DHT with finger table routing
@@ -298,28 +621,8 @@ This implementation includes:
 - ✅ Concurrent popularity lookup
 - ✅ Visualization and plotting
 - ✅ Configurable workload generation
+- ✅ **Docker deployment** with Docker Compose
+- ✅ **Kubernetes deployment** with StatefulSets
 - ✅ Complete documentation
 
-## Academic Integrity
-
-This is an implementation guide for educational purposes. If you're submitting this for academic work:
-- Understand every line of code
-- Customize the implementation
-- Add your own experiments and analysis
-- Properly cite any external resources used
-- Follow your institution's academic integrity policies
-
-## License
-
-This project is provided for educational purposes as part of the Decentralized Data Engineering and Technologies course.
-
-## Contact
-
-For questions about the implementation or experiments, refer to:
-- Course instructors: S. Sioutas, A. Komninos, G. Vonitsanos
-- Course materials and documentation
-
----
-
-**Good luck with your experiments!**
 # Distributed_Hash_Table_CEID
