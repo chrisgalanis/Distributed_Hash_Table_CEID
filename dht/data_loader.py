@@ -85,7 +85,7 @@ def load_movies(file_path: str, max_records: Optional[int] = None) -> List[Tuple
 
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
+            reader = csv.DictReader(f, delimiter=';')
 
             for i, row in enumerate(reader):
                 if max_records and i >= max_records:
