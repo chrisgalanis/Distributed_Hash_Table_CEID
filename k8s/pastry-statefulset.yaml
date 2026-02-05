@@ -2,6 +2,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: pastry-node
+  namespace: dht-system
   labels:
     app: dht-pastry
 spec:
@@ -16,6 +17,7 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: pastry-node
+  namespace: dht-system
 spec:
   serviceName: "pastry-node"
   replicas: 5
@@ -46,19 +48,20 @@ spec:
         - name: B_BITS
           value: "4"
         command:
-        - python
-        - -m
-        - distributed.node_server
-        - --node-id
-        - "$(NODE_ID)"
-        - --protocol
-        - "$(PROTOCOL)"
-        - --port
-        - "8000"
-        - --m
-        - "$(M_BITS)"
-        - --b
-        - "$(B_BITS)"
+        - /bin/sh
+        - -c
+        - |
+          # Extract ordinal from pod name (pastry-node-0 -> 0)
+          ORDINAL=${HOSTNAME##*-}
+          # Calculate node ID (distribute evenly in ID space)
+          # For m=16, max_id=65536, spacing=13107
+          NODE_ID=$((ORDINAL * 13107))
+          exec python -m distributed.node_server \
+            --node-id $NODE_ID \
+            --protocol $(PROTOCOL) \
+            --port 8000 \
+            --m $(M_BITS) \
+            --b $(B_BITS)
         livenessProbe:
           httpGet:
             path: /health

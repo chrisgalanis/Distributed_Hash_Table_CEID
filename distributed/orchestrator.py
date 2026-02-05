@@ -187,6 +187,96 @@ class DistributedOrchestrator:
 
         logger.info("Lookup test complete")
 
+    def run_comprehensive_test(self, items: List[Tuple[str, any]], num_operations: int = 100):
+        """
+        Run comprehensive performance test collecting hop counts for all operations.
+        Returns metrics dictionary for CSV/plotting.
+        """
+        logger.info(f"Running comprehensive test with {num_operations} operations...")
+
+        results = {
+            'lookup': [],
+            'insert': [],
+            'delete': []
+        }
+
+        keys = [key for key, _ in items]
+        values_dict = {key: value for key, value in items}
+        nodes = list(self.node_addresses.keys())
+
+        # Mix of operations
+        operations = ['lookup'] * 50 + ['insert'] * 30 + ['delete'] * 20
+        random.shuffle(operations)
+        operations = operations[:num_operations]
+
+        for i, op_type in enumerate(operations):
+            key = random.choice(keys)
+            node = random.choice(nodes)
+
+            try:
+                if op_type == 'lookup':
+                    hops = self._perform_lookup(node, key)
+                    if hops is not None:
+                        results['lookup'].append(hops)
+
+                elif op_type == 'insert':
+                    value = values_dict.get(key)
+                    if value:
+                        hops = self._perform_insert(node, key, value)
+                        if hops is not None:
+                            results['insert'].append(hops)
+
+                elif op_type == 'delete':
+                    hops = self._perform_delete(node, key)
+                    if hops is not None:
+                        results['delete'].append(hops)
+
+            except Exception as e:
+                logger.error(f"Operation {op_type} failed: {e}")
+
+            if (i + 1) % 20 == 0:
+                logger.info(f"  Progress: {i + 1}/{num_operations}")
+
+        logger.info("Comprehensive test complete")
+        return results
+
+    def _perform_lookup(self, node_id: int, key: str) -> int:
+        """Perform lookup and return hop count."""
+        try:
+            url = f"http://{self.node_addresses[node_id]}/lookup"
+            response = requests.post(url, json={'key': key}, timeout=self.timeout)
+            if response.status_code == 200:
+                return response.json().get('hops', 0)
+        except:
+            pass
+        return None
+
+    def _perform_insert(self, node_id: int, key: str, value: any) -> int:
+        """Perform insert and return hop count."""
+        try:
+            url = f"http://{self.node_addresses[node_id]}/insert"
+            payload = {
+                'key': key,
+                'value': self._serialize_value(value)
+            }
+            response = requests.post(url, json=payload, timeout=self.timeout)
+            if response.status_code == 200:
+                return response.json().get('hops', 0)
+        except:
+            pass
+        return None
+
+    def _perform_delete(self, node_id: int, key: str) -> int:
+        """Perform delete and return hop count."""
+        try:
+            url = f"http://{self.node_addresses[node_id]}/delete"
+            response = requests.post(url, json={'key': key}, timeout=self.timeout)
+            if response.status_code == 200:
+                return response.json().get('hops', 0)
+        except:
+            pass
+        return None
+
 
 def main():
     """Main entry point for orchestrator."""
@@ -202,6 +292,10 @@ def main():
                        help='Number of items to load (default: 100)')
     parser.add_argument('--m', type=int, default=16,
                        help='Bits in identifier space (default: 16)')
+    parser.add_argument('--num-operations', type=int, default=100,
+                       help='Number of operations to test (default: 100)')
+    parser.add_argument('--output', type=str, default=None,
+                       help='Output CSV file for results')
 
     args = parser.parse_args()
 
@@ -270,8 +364,41 @@ def main():
 
     orchestrator.load_data(items)
 
-    # Run test
-    orchestrator.run_lookup_test(keys, num_tests=10)
+    # Run comprehensive test
+    logger.info(f"Running {args.num_operations} operations...")
+    results = orchestrator.run_comprehensive_test(items, num_operations=args.num_operations)
+
+    # Print summary
+    logger.info("\n========== RESULTS ==========")
+    for op_type, hops_list in results.items():
+        if hops_list:
+            avg_hops = sum(hops_list) / len(hops_list)
+            logger.info(f"{op_type.upper()}: avg={avg_hops:.2f} hops, count={len(hops_list)}")
+
+    # Save to CSV if output specified
+    if args.output:
+        import csv
+        import os
+        os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else '.', exist_ok=True)
+
+        with open(args.output, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['protocol', 'operation', 'num_nodes', 'num_items', 'avg_hops', 'max_hops', 'min_hops', 'total_ops'])
+
+            for op_type, hops_list in results.items():
+                if hops_list:
+                    writer.writerow([
+                        args.protocol,
+                        op_type,
+                        args.num_nodes,
+                        args.num_items,
+                        sum(hops_list) / len(hops_list),
+                        max(hops_list),
+                        min(hops_list),
+                        len(hops_list)
+                    ])
+
+        logger.info(f"Results saved to {args.output}")
 
     logger.info("Orchestration complete!")
 
