@@ -82,20 +82,40 @@ def load_movies(file_path: str, max_records: Optional[int] = None) -> List[Tuple
         max_records: Maximum number of records to load (None for all)
     """
     movies = []
+    seen_titles = set()  # Track unique movie titles
 
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
+            # Try comma delimiter first
+            first_line = f.readline()
+            f.seek(0)
+
+            delimiter = ',' if ',' in first_line else ';'
+            reader = csv.DictReader(f, delimiter=delimiter)
 
             for i, row in enumerate(reader):
-                if max_records and i >= max_records:
+                if max_records and len(movies) >= max_records:
                     break
 
-                # Skip rows with missing title
-                if not row.get('title'):
+                # Check for different possible title column names
+                title = row.get('title') or row.get('Movie_Name') or row.get('movie_name')
+                if not title:
                     continue
 
-                movie = Movie(row)
+                # Skip duplicates (same movie can have multiple ratings)
+                if title in seen_titles:
+                    continue
+                seen_titles.add(title)
+
+                # Create Movie object with available data
+                movie_data = {
+                    'id': row.get('id', str(i)),
+                    'title': title,
+                    'genre_names': row.get('genre_names') or row.get('Genre', ''),
+                    'popularity': float(row.get('popularity') or row.get('Rating', '5.0')),
+                }
+
+                movie = Movie(movie_data)
                 normalized_title = normalize_title(movie.title)
 
                 movies.append((normalized_title, movie))

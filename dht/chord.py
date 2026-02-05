@@ -1,10 +1,20 @@
 """Chord DHT implementation."""
 
 import math
+from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple, Dict
 from dht.common import DHT, Message, hash_key, distance_clockwise
 from dht.network import NetworkSimulator
 from dht.local_index import LocalStorage
+
+
+@dataclass
+class FingerEntry:
+    #entry of a nodes finger table | 
+    # finger[k].start = (n + 2^(k-1)) mod 2^m
+    # finger[k].node = successor(finger[k].start)
+    start: int  # The ID this finger is responsible for finding
+    node: Optional[int] = None  # The successor of start
 
 
 class ChordNode:
@@ -19,7 +29,13 @@ class ChordNode:
         # Chord routing state
         self.successor: Optional[int] = None
         self.predecessor: Optional[int] = None
-        self.finger_table: List[Optional[int]] = [None] * m
+
+        # Initialize finger table with FingerEntry objects
+        # finger[k].start = (n + 2^k) mod 2^m for k in [0, m-1]
+        self.finger_table: List[FingerEntry] = []
+        for k in range(m):
+            start = (node_id + 2 ** k) % self.max_id
+            self.finger_table.append(FingerEntry(start=start, node=None))
 
         # Local storage
         self.storage = LocalStorage(use_btree=True)
@@ -36,6 +52,11 @@ class ChordNode:
             return self.predecessor
         elif msg.msg_type == 'get_successor':
             return self.successor
+        elif msg.msg_type == 'notify':
+            # Stabilization: potential predecessor is notifying us to update them
+            potential_pred = msg.data.get('node_id')
+            self._notify(potential_pred)
+            return True
         elif msg.msg_type == 'lookup':
             return self.storage.get(msg.key)
         elif msg.msg_type == 'insert':
@@ -81,11 +102,11 @@ class ChordNode:
 
     def _closest_preceding_node(self, target_id: int) -> int:
         """Find closest node preceding target_id."""
-        # Check finger table in reverse order
+        # Check finger table in reverse order (largest jumps first)
         for i in range(self.m - 1, -1, -1):
-            finger = self.finger_table[i]
-            if finger and self._in_range(finger, self.node_id, target_id, inclusive_start=False, inclusive_end=False):
-                return finger
+            finger_node = self.finger_table[i].node
+            if finger_node is not None and self._in_range(finger_node, self.node_id, target_id, inclusive_start=False, inclusive_end=False):
+                return finger_node
 
         return self.node_id
 
@@ -132,6 +153,80 @@ class ChordNode:
 
         return items_to_transfer
 
+    #in theory its called periodically to verify our successor and notify him
+    def stabilize(self) -> bool:
+        # ask our successor for his predecessor (x)
+        #   If x is between us and our current successor, we should make x our new successor
+        #   Then we must notify our new successor about us
+        if self.successor is None:
+            return False
+
+        # Get predecessor of our successor
+        msg = Message(
+            msg_type='get_predecessor',
+            src_id=self.node_id,
+            dst_id=self.successor
+        )
+        x = self.network.send(msg, count_hop=False)
+
+        updated = False
+        # If x exists and is in interval (self, successor), update successor
+        if x is not None and x != self.node_id and x != self.successor:
+            if self._in_range(x, self.node_id, self.successor,
+                              inclusive_start=False, inclusive_end=False):
+                self.successor = x
+                # Update first finger table entry to match
+                self.finger_table[0].node = x
+                updated = True
+
+        # Notify our successor about us (we might be its predecessor)
+        msg = Message(
+            msg_type='notify',
+            src_id=self.node_id,
+            dst_id=self.successor,
+            data={'node_id': self.node_id}
+        )
+        self.network.send(msg, count_hop=False)
+
+        return updated
+
+    #called when a node thinks it might be our predecessor
+    def _notify(self, potential_predecessor: int):
+        #If a node thinks he is our new predecessor we:
+        # 1. IF we already have one
+        # 2. IF he is between our current predecessor and us, then we MUST update him as our new predecessor
+        if potential_predecessor is None:
+            return
+
+        if self.predecessor is None:
+            self.predecessor = potential_predecessor
+        elif self._in_range(potential_predecessor, self.predecessor, self.node_id,
+                            inclusive_start=False, inclusive_end=False):
+            self.predecessor = potential_predecessor
+
+    def fix_finger(self, i: int) -> bool:
+        if i < 0 or i >= self.m:
+            return False
+
+        finger_entry = self.finger_table[i]
+        old_node = finger_entry.node
+
+        # Find successor of finger[i].start
+        msg = Message(
+            msg_type='find_successor',
+            src_id=self.node_id,
+            dst_id=self.node_id,
+            data={'target_id': finger_entry.start}
+        )
+        new_node = self.network.send(msg, count_hop=False)
+        finger_entry.node = new_node
+
+        # Keep successor in sync with finger[0]
+        if i == 0:
+            self.successor = new_node
+
+        return old_node != new_node
+
 
 class Chord(DHT):
     """Chord DHT implementation."""
@@ -170,10 +265,10 @@ class Chord(DHT):
         for nid in sorted_nodes:
             node = self.nodes[nid]
             for i in range(self.m):
-                start = (nid + 2 ** i) % self.max_id
-                # Find successor of start
-                finger = self._find_successor_static(start, sorted_nodes)
-                node.finger_table[i] = finger
+                # finger_table[i].start is already set in ChordNode.__init__
+                # Just need to set the node (successor of start)
+                finger = self._find_successor_static(node.finger_table[i].start, sorted_nodes)
+                node.finger_table[i].node = finger
 
         # Insert initial items
         for key, value in items:
@@ -401,9 +496,22 @@ class Chord(DHT):
         for nid in sorted_nodes:
             node = self.nodes[nid]
             for i in range(self.m):
-                start = (nid + 2 ** i) % self.max_id
-                finger = self._find_successor_static(start, sorted_nodes)
-                node.finger_table[i] = finger
+                # finger_table[i].start is already correct
+                finger = self._find_successor_static(node.finger_table[i].start, sorted_nodes)
+                node.finger_table[i].node = finger
+
+    def stabilize_all(self, rounds: int = 3):
+        # TODO: Should run in the background - could happen by spawning a thread that runs multiple rounds of stabilize on nodes that were updated, or just run stabilize for random nodes every [interval]
+        #runs multiple rounds of stabilize and fix_finger
+        for _ in range(rounds):
+            # Run stabilize on all nodes
+            for node in self.nodes.values():
+                node.stabilize()
+
+        # Fix all finger table entries
+        for node in self.nodes.values():
+            for i in range(self.m):
+                node.fix_finger(i)
 
     def get_all_nodes(self) -> List[int]:
         """Get list of all node IDs."""

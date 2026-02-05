@@ -9,7 +9,7 @@ import os
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from dht.chord import ChordNode
+from dht.chord import ChordNode, FingerEntry
 from dht.pastry import PastryNode
 from dht.common import Message
 from distributed.network_real import DistributedNetwork
@@ -103,7 +103,15 @@ class DHTNodeServer:
                     # Set Chord routing info
                     self.node.successor = data.get('successor')
                     self.node.predecessor = data.get('predecessor')
-                    self.node.finger_table = data.get('finger_table', [None] * self.m)
+
+                    # Convert finger table from list of node IDs to list of FingerEntry objects
+                    finger_nodes = data.get('finger_table', [None] * self.m)
+                    finger_table = []
+                    for k in range(self.m):
+                        start = (self.node_id + 2 ** k) % (2 ** self.m)
+                        node = finger_nodes[k] if k < len(finger_nodes) else None
+                        finger_table.append(FingerEntry(start=start, node=node))
+                    self.node.finger_table = finger_table
 
                 elif self.protocol == "pastry":
                     # Initialize Pastry node with all nodes
@@ -160,6 +168,110 @@ class DHTNodeServer:
 
             except Exception as e:
                 logger.error(f"Error getting info: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/stats', methods=['GET'])
+        def stats():
+            """Get network statistics (hop counts)."""
+            try:
+                return jsonify(self.network.get_stats())
+            except Exception as e:
+                logger.error(f"Error getting stats: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/reset_stats', methods=['POST'])
+        def reset_stats():
+            """Reset network statistics."""
+            try:
+                self.network.reset_counters()
+                return jsonify({'status': 'reset'})
+            except Exception as e:
+                logger.error(f"Error resetting stats: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/lookup', methods=['POST'])
+        def lookup():
+            """Perform DHT lookup operation."""
+            try:
+                data = request.get_json()
+                key = data['key']
+
+                if self.node is None:
+                    return jsonify({'error': 'Node not initialized'}), 500
+
+                # Reset hop counter before operation
+                self.network.reset_counters()
+
+                # Perform lookup
+                values, local_hops = self.node.lookup(key)
+
+                # Get total hops from network
+                stats = self.network.get_stats()
+
+                return jsonify({
+                    'values': self._serialize_value(values),
+                    'hops': stats['total_hops']
+                })
+
+            except Exception as e:
+                logger.error(f"Error in lookup: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/insert', methods=['POST'])
+        def insert():
+            """Perform DHT insert operation."""
+            try:
+                data = request.get_json()
+                key = data['key']
+                value = self._deserialize_value(data['value'])
+
+                if self.node is None:
+                    return jsonify({'error': 'Node not initialized'}), 500
+
+                # Reset hop counter
+                self.network.reset_counters()
+
+                # Perform insert
+                hops = self.node.insert(key, value)
+
+                # Get total hops
+                stats = self.network.get_stats()
+
+                return jsonify({
+                    'hops': stats['total_hops'],
+                    'status': 'inserted'
+                })
+
+            except Exception as e:
+                logger.error(f"Error in insert: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/delete', methods=['POST'])
+        def delete():
+            """Perform DHT delete operation."""
+            try:
+                data = request.get_json()
+                key = data['key']
+
+                if self.node is None:
+                    return jsonify({'error': 'Node not initialized'}), 500
+
+                # Reset hop counter
+                self.network.reset_counters()
+
+                # Perform delete
+                hops = self.node.delete(key)
+
+                # Get total hops
+                stats = self.network.get_stats()
+
+                return jsonify({
+                    'hops': stats['total_hops'],
+                    'status': 'deleted'
+                })
+
+            except Exception as e:
+                logger.error(f"Error in delete: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
     def _serialize_value(self, value):
