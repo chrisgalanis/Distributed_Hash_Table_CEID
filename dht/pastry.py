@@ -31,8 +31,9 @@ class PastryNode:
         # Build routing structures
         self._build_routing_structures(all_nodes)
 
-        # Register with network
-        network.register_node(node_id, self.handle_message)
+        # Register with network (only for NetworkSimulator, not DistributedNetwork)
+        if hasattr(network, 'nodes'):
+            network.register_node(node_id, self.handle_message)
 
     def _init_routing_table(self):
         """Initialize empty routing table."""
@@ -127,6 +128,13 @@ class PastryNode:
             return self._get_responsible_keys()
         else:
             return None
+
+    def route(self, target_id: int) -> int:
+        """
+        Public method to route to node responsible for target_id.
+        Initiates routing through the DHT.
+        """
+        return self._route_handler(target_id)
 
     def _route_handler(self, target_id: int, visited: Set[int] = None) -> int:
         """Route to node responsible for target_id."""
@@ -225,6 +233,96 @@ class PastryNode:
     def _get_responsible_keys(self) -> List[Tuple[str, List[Any]]]:
         """Get all keys this node is responsible for."""
         return self.storage.get_all_items()
+
+    # High-level DHT operations (for both simulated and distributed modes)
+    def lookup(self, key: str) -> Tuple[Optional[List[Any]], int]:
+        """
+        Lookup a key in the DHT.
+        Returns (values, hops) tuple.
+        """
+        if hasattr(self.network, 'reset_counters'):
+            self.network.reset_counters()
+
+        key_id = hash_key(key, self.m)
+        responsible_node = self.route(key_id)
+
+        msg = Message(
+            msg_type='lookup',
+            src_id=self.node_id,
+            dst_id=responsible_node,
+            key=key
+        )
+        values = self.network.send(msg, count_hop=False)
+
+        if hasattr(self.network, 'get_stats'):
+            stats = self.network.get_stats()
+            hops = stats['total_hops']
+        else:
+            hops = 0
+
+        return values, hops
+
+    def insert(self, key: str, value: Any) -> int:
+        """Insert a key-value pair into the DHT. Returns number of hops."""
+        if hasattr(self.network, 'reset_counters'):
+            self.network.reset_counters()
+
+        key_id = hash_key(key, self.m)
+        responsible_node = self.route(key_id)
+
+        msg = Message(
+            msg_type='insert',
+            src_id=self.node_id,
+            dst_id=responsible_node,
+            key=key,
+            value=value
+        )
+        self.network.send(msg, count_hop=False)
+
+        if hasattr(self.network, 'get_stats'):
+            return self.network.get_stats()['total_hops']
+        return 0
+
+    def delete(self, key: str) -> int:
+        """Delete a key from the DHT. Returns number of hops."""
+        if hasattr(self.network, 'reset_counters'):
+            self.network.reset_counters()
+
+        key_id = hash_key(key, self.m)
+        responsible_node = self.route(key_id)
+
+        msg = Message(
+            msg_type='delete',
+            src_id=self.node_id,
+            dst_id=responsible_node,
+            key=key
+        )
+        self.network.send(msg, count_hop=False)
+
+        if hasattr(self.network, 'get_stats'):
+            return self.network.get_stats()['total_hops']
+        return 0
+
+    def update(self, key: str, value: Any) -> int:
+        """Update a key's value in the DHT. Returns number of hops."""
+        if hasattr(self.network, 'reset_counters'):
+            self.network.reset_counters()
+
+        key_id = hash_key(key, self.m)
+        responsible_node = self.route(key_id)
+
+        msg = Message(
+            msg_type='update',
+            src_id=self.node_id,
+            dst_id=responsible_node,
+            key=key,
+            value=value
+        )
+        self.network.send(msg, count_hop=False)
+
+        if hasattr(self.network, 'get_stats'):
+            return self.network.get_stats()['total_hops']
+        return 0
 
 
 class Pastry(DHT):

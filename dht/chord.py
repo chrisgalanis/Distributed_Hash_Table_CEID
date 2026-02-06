@@ -40,8 +40,10 @@ class ChordNode:
         # Local storage
         self.storage = LocalStorage(use_btree=True)
 
-        # Register with network
-        network.register_node(node_id, self.handle_message)
+        # Register with network (only for NetworkSimulator, not DistributedNetwork)
+        # DistributedNetwork uses addresses, not handlers
+        if hasattr(network, 'nodes'):  # NetworkSimulator has 'nodes' attribute (dict of handlers)
+            network.register_node(node_id, self.handle_message)
 
     def handle_message(self, msg: Message) -> Any:
         """Handle incoming messages."""
@@ -79,6 +81,31 @@ class ChordNode:
             return self._transfer_keys(start, end)
         else:
             return None
+
+    def find_successor(self, target_id: int) -> int:
+        """
+        Public method to find successor of target_id.
+        Initiates routing through the DHT.
+        """
+        # If target is between us and our successor, return successor
+        if self.successor and self._in_range(target_id, self.node_id, self.successor, inclusive_end=True):
+            return self.successor
+
+        # Otherwise, find closest preceding node and forward
+        closest = self._closest_preceding_node(target_id)
+
+        if closest == self.node_id:
+            # We are the closest, return our successor
+            return self.successor if self.successor else self.node_id
+
+        # Forward to closest node
+        msg = Message(
+            msg_type='find_successor',
+            src_id=self.node_id,
+            dst_id=closest,
+            data={'target_id': target_id}
+        )
+        return self.network.send(msg)
 
     def _find_successor_handler(self, target_id: int) -> int:
         """Find successor of target_id."""
@@ -226,6 +253,111 @@ class ChordNode:
             self.successor = new_node
 
         return old_node != new_node
+
+    # High-level DHT operations (for both simulated and distributed modes)
+    def lookup(self, key: str) -> Tuple[Optional[List[Any]], int]:
+        """
+        Lookup a key in the DHT.
+        Returns (values, hops) tuple.
+        """
+        # Reset hop counter if we have access to it
+        if hasattr(self.network, 'reset_counters'):
+            self.network.reset_counters()
+
+        # Hash the key to get ID
+        key_id = hash_key(key, self.m)
+
+        # Find responsible node
+        responsible_node = self.find_successor(key_id)
+
+        # Send lookup message
+        msg = Message(
+            msg_type='lookup',
+            src_id=self.node_id,
+            dst_id=responsible_node,
+            key=key
+        )
+        values = self.network.send(msg, count_hop=False)  # Don't count the final data retrieval
+
+        # Get hop count
+        if hasattr(self.network, 'get_stats'):
+            stats = self.network.get_stats()
+            hops = stats['total_hops']
+        else:
+            hops = 0
+
+        return values, hops
+
+    def insert(self, key: str, value: Any) -> int:
+        """
+        Insert a key-value pair into the DHT.
+        Returns number of hops.
+        """
+        if hasattr(self.network, 'reset_counters'):
+            self.network.reset_counters()
+
+        key_id = hash_key(key, self.m)
+        responsible_node = self.find_successor(key_id)
+
+        msg = Message(
+            msg_type='insert',
+            src_id=self.node_id,
+            dst_id=responsible_node,
+            key=key,
+            value=value
+        )
+        self.network.send(msg, count_hop=False)
+
+        if hasattr(self.network, 'get_stats'):
+            return self.network.get_stats()['total_hops']
+        return 0
+
+    def delete(self, key: str) -> int:
+        """
+        Delete a key from the DHT.
+        Returns number of hops.
+        """
+        if hasattr(self.network, 'reset_counters'):
+            self.network.reset_counters()
+
+        key_id = hash_key(key, self.m)
+        responsible_node = self.find_successor(key_id)
+
+        msg = Message(
+            msg_type='delete',
+            src_id=self.node_id,
+            dst_id=responsible_node,
+            key=key
+        )
+        self.network.send(msg, count_hop=False)
+
+        if hasattr(self.network, 'get_stats'):
+            return self.network.get_stats()['total_hops']
+        return 0
+
+    def update(self, key: str, value: Any) -> int:
+        """
+        Update a key's value in the DHT.
+        Returns number of hops.
+        """
+        if hasattr(self.network, 'reset_counters'):
+            self.network.reset_counters()
+
+        key_id = hash_key(key, self.m)
+        responsible_node = self.find_successor(key_id)
+
+        msg = Message(
+            msg_type='update',
+            src_id=self.node_id,
+            dst_id=responsible_node,
+            key=key,
+            value=value
+        )
+        self.network.send(msg, count_hop=False)
+
+        if hasattr(self.network, 'get_stats'):
+            return self.network.get_stats()['total_hops']
+        return 0
 
 
 class Chord(DHT):
