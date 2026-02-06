@@ -547,7 +547,7 @@ class Chord(DHT):
         arbitrary_node = list(self.nodes.keys())[0]
         successor = self._find_successor(new_node_id, arbitrary_node)
 
-        # Get predecessor of successor
+        # Get predecessor of successor - this is a bit off-paper implementation, usually this is handled by the stabilization but it just made more sense (as seen from sioutas lecture) to copy the predecessor from new node's successor.
         msg = Message(msg_type='get_predecessor', src_id=new_node_id, dst_id=successor)
         predecessor = self.network.send(msg, count_hop=False)
 

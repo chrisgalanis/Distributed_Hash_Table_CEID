@@ -1,7 +1,5 @@
-"""Pastry DHT implementation."""
-
 import math
-from typing import Any, List, Optional, Tuple, Dict, Set
+from typing import Any, List, Optional, Tuple, Dict, Set, Callable
 from dht.common import DHT, Message, hash_key
 from dht.network import NetworkSimulator
 from dht.local_index import LocalStorage
@@ -10,330 +8,402 @@ from dht.local_index import LocalStorage
 class PastryNode:
     """A node in the Pastry DHT."""
 
-    def __init__(self, node_id: int, m: int, b: int, network: NetworkSimulator, all_nodes: Set[int]):
+    LEAF_HALF = 4  # L/2 nodes on each side of the leaf set
+
+    def __init__(self, node_id: int, m: int, b: int, network: NetworkSimulator):
         self.node_id = node_id
-        self.m = m  # Number of bits in identifier
-        self.b = b  # Number of bits per digit (typically 4 for hex)
+        self.m = m
+        self.b = b
         self.max_id = 2 ** m
-        self.base = 2 ** b  # Base for routing (16 for b=4)
+        self.base = 2 ** b
+        self.num_digits = (m + b - 1) // b
         self.network = network
 
-        # Pastry routing state
-        self.leaf_set: List[int] = []  # Closest nodes numerically
-        self.routing_table: List[List[Optional[int]]] = []  # Prefix-based routing
+        self.leaf_smaller: List[int] = []
+        self.leaf_larger: List[int] = []
 
-        # Local storage
+        # Routing table: [row][col]
+        # Row i = matching prefix of length i
+        self.routing_table: List[List[Optional[int]]] = [
+            [None] * self.base for _ in range(self.num_digits)
+        ]
+
         self.storage = LocalStorage(use_btree=True)
+        network.register_node(node_id, self.handle_message)
 
-        # Initialize routing structures
-        self._init_routing_table()
+        # REFACTOR: Message Dispatcher
+        # Replaces the giant if/elif chain for cleaner architecture.
+        self._handlers: Dict[str, Callable[[Message], Any]] = {
+            'route': self._handle_route_msg,
+            'lookup': lambda m: self.storage.get(m.key),
+            'insert': lambda m: self.storage.put(m.key, m.value),
+            'delete': lambda m: self.storage.delete(m.key),
+            'update': lambda m: self.storage.update(m.key, m.value),
+            'get_all_keys': lambda m: self.storage.get_all_keys(),
+            'get_all_items': lambda m: self.storage.get_all_items(),
+            'join_route': self._handle_join_route_msg,
+            'notify_arrival': self._handle_notify_arrival,
+            'transfer_keys': lambda m: self.storage.get_all_items(),
+        }
 
-        # Build routing structures
-        self._build_routing_structures(all_nodes)
+    # --- Helper: Geometry & Arithmetic ---
 
-        # Register with network (only for NetworkSimulator, not DistributedNetwork)
-        if hasattr(network, 'nodes'):
-            network.register_node(node_id, self.handle_message)
-
-    def _init_routing_table(self):
-        """Initialize empty routing table."""
-        rows = (self.m + self.b - 1) // self.b  # Number of rows
-        self.routing_table = [[None] * self.base for _ in range(rows)]
-
-    def _build_routing_structures(self, all_nodes: Set[int]):
-        """Build leaf set and routing table from all nodes."""
-        # Build leaf set (L closest nodes on each side)
-        L = 8  # Typical leaf set size
-        nodes_list = sorted(all_nodes)
-
-        # Find position of this node
-        idx = nodes_list.index(self.node_id)
-        n = len(nodes_list)
-
-        # Get L/2 nodes on each side (wrapping around)
-        leaf_size = min(L, n - 1)
-        self.leaf_set = []
-        for i in range(1, leaf_size + 1):
-            left_idx = (idx - i) % n
-            right_idx = (idx + i) % n
-            if len(self.leaf_set) < leaf_size:
-                self.leaf_set.append(nodes_list[left_idx])
-            if len(self.leaf_set) < leaf_size:
-                self.leaf_set.append(nodes_list[right_idx])
-
-        # Build routing table
-        for node in all_nodes:
-            if node == self.node_id:
-                continue
-
-            shared_prefix_len = self._shared_prefix_length(self.node_id, node)
-            if shared_prefix_len < len(self.routing_table):
-                digit = self._get_digit(node, shared_prefix_len)
-                if self.routing_table[shared_prefix_len][digit] is None:
-                    self.routing_table[shared_prefix_len][digit] = node
-
-    def _shared_prefix_length(self, id1: int, id2: int) -> int:
-        """Calculate length of shared prefix in base-2^b."""
-        s1 = self._to_base_b_string(id1)
-        s2 = self._to_base_b_string(id2)
-
-        shared = 0
-        for c1, c2 in zip(s1, s2):
-            if c1 == c2:
-                shared += 1
-            else:
-                break
-        return shared
-
-    def _to_base_b_string(self, node_id: int) -> str:
-        """Convert node ID to base-2^b string."""
-        digits = (self.m + self.b - 1) // self.b
+    def _to_digits(self, node_id: int) -> Tuple[int, ...]:
+        """Convert a numeric ID to a tuple of base-2^b digits (MSB first)."""
         result = []
-        for i in range(digits):
-            digit = (node_id >> (self.m - (i + 1) * self.b)) & ((1 << self.b) - 1)
+        for i in range(self.num_digits):
+            shift = self.m - (i + 1) * self.b
+            if shift < 0:
+                digit = node_id & ((1 << (self.b + shift)) - 1) if (self.b + shift) > 0 else 0
+            else:
+                digit = (node_id >> shift) & ((1 << self.b) - 1)
             result.append(digit)
         return tuple(result)
 
+    def _shared_prefix_length(self, id1: int, id2: int) -> int:
+        """Return the number of leading digits shared between two IDs."""
+        d1 = self._to_digits(id1)
+        d2 = self._to_digits(id2)
+        length = 0
+        for a, b in zip(d1, d2):
+            if a == b:
+                length += 1
+            else:
+                break
+        return length
+
     def _get_digit(self, node_id: int, position: int) -> int:
-        """Get digit at position in base-2^b representation."""
-        digits_tuple = self._to_base_b_string(node_id)
-        if position < len(digits_tuple):
-            return digits_tuple[position]
+        digits = self._to_digits(node_id)
+        if position < len(digits):
+            return digits[position]
         return 0
 
-    def handle_message(self, msg: Message) -> Any:
-        """Handle incoming messages."""
-        if msg.msg_type == 'route':
-            target_id = msg.data['target_id']
-            visited = msg.data.get('visited', None)
-            return self._route_handler(target_id, visited)
-        elif msg.msg_type == 'lookup':
-            return self.storage.get(msg.key)
-        elif msg.msg_type == 'insert':
-            self.storage.put(msg.key, msg.value)
+    def _circular_distance(self, a: int, b: int) -> int:
+        diff = abs(a - b)
+        return min(diff, self.max_id - diff)
+
+    def _circular_between(self, x: int, lo: int, hi: int) -> bool:
+        if lo <= hi:
+            return lo <= x <= hi
+        return x >= lo or x <= hi
+
+    # --- Component: Leaf Set Management ---
+
+    @property
+    def leaf_set(self) -> List[int]:
+        return self.leaf_smaller + self.leaf_larger
+
+    def _leaf_set_min(self) -> int:
+        return self.leaf_smaller[-1] if self.leaf_smaller else self.node_id
+
+    def _leaf_set_max(self) -> int:
+        return self.leaf_larger[-1] if self.leaf_larger else self.node_id
+
+    def _is_in_leaf_set_range(self, key: int) -> bool:
+        if not self.leaf_smaller and not self.leaf_larger:
             return True
-        elif msg.msg_type == 'delete':
-            self.storage.delete(msg.key)
-            return True
-        elif msg.msg_type == 'update':
-            self.storage.update(msg.key, msg.value)
-            return True
-        elif msg.msg_type == 'get_all_keys':
-            return self.storage.get_all_keys()
-        elif msg.msg_type == 'get_all_items':
-            return self.storage.get_all_items()
-        elif msg.msg_type == 'get_leaf_set':
-            return self.leaf_set
-        elif msg.msg_type == 'transfer_keys':
-            return self._get_responsible_keys()
+        return self._circular_between(key, self._leaf_set_min(), self._leaf_set_max())
+
+    def _add_to_leaf_set(self, node_id: int):
+        if node_id == self.node_id: return
+        clockwise = (node_id - self.node_id) % self.max_id
+        counter = (self.node_id - node_id) % self.max_id
+
+        if clockwise <= counter:
+            if node_id not in self.leaf_larger:
+                self.leaf_larger.append(node_id)
+                self.leaf_larger.sort(key=lambda x: (x - self.node_id) % self.max_id)
+                if len(self.leaf_larger) > self.LEAF_HALF:
+                    self.leaf_larger.pop()
         else:
-            return None
+            if node_id not in self.leaf_smaller:
+                self.leaf_smaller.append(node_id)
+                self.leaf_smaller.sort(key=lambda x: (self.node_id - x) % self.max_id)
+                if len(self.leaf_smaller) > self.LEAF_HALF:
+                    self.leaf_smaller.pop()
 
-    def route(self, target_id: int) -> int:
-        """
-        Public method to route to node responsible for target_id.
-        Initiates routing through the DHT.
-        """
-        return self._route_handler(target_id)
+    # --- Component: Routing Table Management ---
 
-    def _route_handler(self, target_id: int, visited: Set[int] = None) -> int:
-        """Route to node responsible for target_id."""
-        # Initialize visited set to detect loops
-        if visited is None:
-            visited = set()
+    def _add_to_routing_table(self, node_id: int):
+        if node_id == self.node_id: return
+        spl = self._shared_prefix_length(self.node_id, node_id)
+        if spl >= self.num_digits: return
+        
+        col = self._get_digit(node_id, spl)
+        if self.routing_table[spl][col] is None:
+            self.routing_table[spl][col] = node_id
 
-        # Loop detection
-        if self.node_id in visited:
-            return self.node_id
+    def _build_leaf_set(self, all_nodes: Set[int]):
+        """Build leaf set from scratch given all node IDs (for bulk init)."""
+        self.leaf_smaller.clear()
+        self.leaf_larger.clear()
+        for nid in all_nodes:
+            if nid != self.node_id:
+                self._add_to_leaf_set(nid)
+
+    def _build_routing_table(self, all_nodes: Set[int]):
+        """Build routing table from scratch given all node IDs (for bulk init)."""
+        self.routing_table = [[None] * self.base for _ in range(self.num_digits)]
+        for nid in all_nodes:
+            self._add_to_routing_table(nid)
+
+    def _get_routing_table_row(self, row: int) -> List[Optional[int]]:
+        if 0 <= row < len(self.routing_table):
+            return list(self.routing_table[row])
+        return [None] * self.base
+
+    def _merge_routing_table_row(self, row_idx: int, entries: List[Optional[int]]):
+        """Merge a row from another node into our table."""
+        if row_idx < 0 or row_idx >= self.num_digits: return
+        
+        for col, entry in enumerate(entries):
+            if entry is not None and entry != self.node_id:
+                self._add_to_routing_table(entry)
+
+    # --- Core Algorithm: Routing (Slide 13) ---
+
+    def route(self, key: int, visited: Optional[Set[int]] = None) -> int:
+        if visited is None: visited = set()
+        if self.node_id in visited: return self.node_id
         visited.add(self.node_id)
 
-        # Check if target is in leaf set range or we're the closest
-        if self._is_in_leaf_set_range(target_id):
-            # Find closest node in leaf set
-            return self._find_closest_node(target_id, self.leaf_set + [self.node_id])
+        # 1. Leaf Set (Exact match or numeric closeness)
+        if self._is_in_leaf_set_range(key):
+            closest = self._find_closest_in(key, self.leaf_set + [self.node_id])
+            return closest if closest is not None else self.node_id
 
-        # Use routing table
-        shared_len = self._shared_prefix_length(self.node_id, target_id)
-        next_digit = self._get_digit(target_id, shared_len)
+        # 2. Routing Table (Long Jump)
+        spl = self._shared_prefix_length(self.node_id, key)
+        if spl < self.num_digits:
+            next_digit = self._get_digit(key, spl)
+            entry = self.routing_table[spl][next_digit]
+            if entry is not None and entry != self.node_id and entry not in visited:
+                return self._forward_route(entry, key, visited)
 
-        if shared_len < len(self.routing_table) and self.routing_table[shared_len][next_digit] is not None:
-            next_hop = self.routing_table[shared_len][next_digit]
+        # 3. Rare Case (The Crawl)
+        # ACADEMIC CORRECTION (Slide 13):
+        # "Search node T with longest prefix (T,K) out of merged set"
+        # Only if prefix lengths are equal do we use numeric distance.
+        return self._rare_case_routing(key, visited, current_spl=spl)
 
-            # Don't forward to ourselves or already visited nodes
-            if next_hop == self.node_id or next_hop in visited:
-                return self.node_id
+    def _rare_case_routing(self, key: int, visited: Set[int], current_spl: int) -> int:
+        best_node = None
+        best_spl = current_spl
+        best_dist = self._circular_distance(self.node_id, key)
 
-            # Forward to next hop
-            msg = Message(
-                msg_type='route',
-                src_id=self.node_id,
-                dst_id=next_hop,
-                data={'target_id': target_id, 'visited': visited}
-            )
-            return self.network.send(msg)
+        # Optimization: Generator avoids building a full set of all nodes in memory
+        def iterate_known_nodes():
+            yield from self.leaf_set
+            for row in self.routing_table:
+                for entry in row:
+                    if entry is not None: yield entry
 
-        # Rare case: forward to numerically closer node
-        candidates = [n for row in self.routing_table for n in row if n is not None]
-        candidates.extend(self.leaf_set)
+        for candidate in iterate_known_nodes():
+            if candidate == self.node_id or candidate in visited:
+                continue
+            
+            cand_spl = self._shared_prefix_length(candidate, key)
+            cand_dist = self._circular_distance(candidate, key)
 
-        # Filter out visited nodes
-        candidates = [c for c in candidates if c not in visited]
+            # Slide 13 Logic: 
+            # 1. Must have prefix at least as long as current node (cand_spl >= current_spl)
+            # 2. If longer prefix, it wins immediately.
+            # 3. If same prefix, must be numerically closer.
+            if cand_spl > best_spl:
+                best_spl = cand_spl
+                best_dist = cand_dist
+                best_node = candidate
+            elif cand_spl == best_spl:
+                if cand_dist < best_dist:
+                    best_dist = cand_dist
+                    best_node = candidate
 
-        if not candidates:
-            # No more candidates, we must be responsible
-            return self.node_id
+        if best_node:
+            return self._forward_route(best_node, key, visited)
+        return self.node_id
 
-        candidates.append(self.node_id)
-        closest = self._find_closest_node(target_id, candidates)
+    def _find_closest_in(self, key: int, candidates: List[int]) -> Optional[int]:
+        if not candidates: return None
+        # Tie-break: on equal distance, lower node ID wins
+        return min(candidates, key=lambda n: (self._circular_distance(key, n), n))
 
-        if closest == self.node_id:
-            return self.node_id
-
-        msg = Message(
-            msg_type='route',
-            src_id=self.node_id,
-            dst_id=closest,
-            data={'target_id': target_id, 'visited': visited}
-        )
+    def _forward_route(self, next_hop: int, key: int, visited: Set[int]) -> int:
+        msg = Message('route', src_id=self.node_id, dst_id=next_hop, 
+                      data={'target_id': key, 'visited': visited})
         return self.network.send(msg)
 
-    def _is_in_leaf_set_range(self, target_id: int) -> bool:
-        """Check if target is within leaf set range."""
-        if not self.leaf_set:
-            return True
-
-        min_leaf = min(self.leaf_set + [self.node_id])
-        max_leaf = max(self.leaf_set + [self.node_id])
-
-        # Simple check (doesn't handle wrap-around perfectly)
-        return min_leaf <= target_id <= max_leaf
-
-    def _find_closest_node(self, target_id: int, candidates: List[int]) -> int:
-        """Find numerically closest node to target."""
-        if not candidates:
-            return self.node_id
-
-        closest = candidates[0]
-        min_dist = self._circular_distance(target_id, closest)
-
-        for node in candidates[1:]:
-            dist = self._circular_distance(target_id, node)
-            if dist < min_dist:
-                min_dist = dist
-                closest = node
-
-        return closest
-
-    def _circular_distance(self, id1: int, id2: int) -> int:
-        """Calculate circular distance between two IDs."""
-        direct = abs(id1 - id2)
-        wrap = self.max_id - direct
-        return min(direct, wrap)
-
-    def _get_responsible_keys(self) -> List[Tuple[str, List[Any]]]:
-        """Get all keys this node is responsible for."""
-        return self.storage.get_all_items()
-
-    # High-level DHT operations (for both simulated and distributed modes)
-    def lookup(self, key: str) -> Tuple[Optional[List[Any]], int]:
+    # --- Core Algorithm: Bootstrapping (Autonomous Join) ---
+    
+    def bootstrap(self, bootstrap_node_id: int):
         """
-        Lookup a key in the DHT.
-        Returns (values, hops) tuple.
+        Perform the full Pastry join protocol autonomously.
+        This moves the logic out of the 'God Class' Pastry object.
         """
-        if hasattr(self.network, 'reset_counters'):
-            self.network.reset_counters()
-
-        key_id = hash_key(key, self.m)
-        responsible_node = self.route(key_id)
-
-        msg = Message(
-            msg_type='lookup',
+        if bootstrap_node_id == self.node_id:
+            return # First node in network
+            
+        # 1. Route JOIN message to ourselves via bootstrap node
+        join_msg = Message(
+            msg_type='join_route',
             src_id=self.node_id,
-            dst_id=responsible_node,
-            key=key
+            dst_id=bootstrap_node_id,
+            data={
+                'new_node_id': self.node_id,
+                'collected_rows': {},  # Accumulator for routing rows
+                'hops_path': [],       # Track path for robustness
+            }
         )
-        values = self.network.send(msg, count_hop=False)
+        
+        # In a real async network, this would be a callback. 
+        # In simulation, 'send' returns the final response from Z (closest node).
+        result = self.network.send(join_msg)
+        
+        if not result: return
 
-        if hasattr(self.network, 'get_stats'):
-            stats = self.network.get_stats()
-            hops = stats['total_hops']
-        else:
-            hops = 0
+        # 2. Process the "Harvest" (Slide 19-24)
+        # Populate routing table from collected rows
+        collected_rows = result.get('collected_rows', {})
+        for row_idx, entries in collected_rows.items():
+            self._merge_routing_table_row(row_idx, entries)
 
-        return values, hops
+        # Populate leaf set from Z (the closest node)
+        z_leaves = result.get('leaf_set', ([], []))
+        all_candidates = set(z_leaves[0] + z_leaves[1] + result.get('hops_path', []))
+        all_candidates.add(result.get('z_node'))
+        
+        for cand in all_candidates:
+            if cand: self._add_to_leaf_set(cand)
+            if cand: self._add_to_routing_table(cand)
 
-    def insert(self, key: str, value: Any) -> int:
-        """Insert a key-value pair into the DHT. Returns number of hops."""
-        if hasattr(self.network, 'reset_counters'):
-            self.network.reset_counters()
+        # 3. Notify everyone in our new state
+        self._broadcast_arrival()
+        
+        # 4. Request keys from Z and all leaf neighbors
+        donors = set(self.leaf_set)
+        z_node = result.get('z_node')
+        if z_node: donors.add(z_node)
+        for donor_id in donors:
+            self._request_keys_from(donor_id)
 
-        key_id = hash_key(key, self.m)
-        responsible_node = self.route(key_id)
+    def _broadcast_arrival(self):
+        """Send 'notify_arrival' to all neighbors."""
+        targets = set(self.leaf_set)
+        for row in self.routing_table:
+            for entry in row:
+                if entry: targets.add(entry)
+        
+        for target in targets:
+            self.network.send(Message(
+                'notify_arrival', src_id=self.node_id, dst_id=target,
+                data={'new_node_id': self.node_id}
+            ), count_hop=False)
 
-        msg = Message(
-            msg_type='insert',
-            src_id=self.node_id,
-            dst_id=responsible_node,
-            key=key,
-            value=value
+    def _request_keys_from(self, z_node_id: int):
+        """Ask Z for keys that now belong to me, and delete them from Z."""
+        if z_node_id is None: return
+        msg = Message('transfer_keys', src_id=self.node_id, dst_id=z_node_id)
+        items = self.network.send(msg, count_hop=False)
+        
+        if items:
+            keys_to_take = []
+            for k, v_list in items:
+                key_id = hash_key(k, self.m)
+                my_dist = self._circular_distance(key_id, self.node_id)
+                z_dist = self._circular_distance(key_id, z_node_id)
+                if my_dist < z_dist or (my_dist == z_dist and self.node_id < z_node_id):
+                    for v in v_list:
+                        self.storage.put(k, v)
+                    keys_to_take.append(k)
+            # Tell Z to delete the transferred keys
+            for k in keys_to_take:
+                self.network.send(Message('delete', src_id=self.node_id, dst_id=z_node_id, key=k), count_hop=False)
+
+    # --- Handlers ---
+
+    def handle_message(self, msg: Message) -> Any:
+        handler = self._handlers.get(msg.msg_type)
+        if handler:
+            return handler(msg)
+        return None
+
+    def _handle_route_msg(self, msg: Message) -> Any:
+        return self.route(msg.data['target_id'], msg.data.get('visited'))
+
+    def _handle_notify_arrival(self, msg: Message) -> bool:
+        new_id = msg.data['new_node_id']
+        self._add_to_leaf_set(new_id)
+        self._add_to_routing_table(new_id)
+        return True
+
+    def _handle_join_route_msg(self, msg: Message) -> Dict:
+        """
+        Handle a JOIN message passing through.
+        Logic: Add MY routing row to the message, then forward or finish.
+        """
+        new_id = msg.data['new_node_id']
+        collected_rows = msg.data.get('collected_rows', {})
+        hops_path = msg.data.get('hops_path', [])
+
+        # ACADEMIC NOTE (Slide 19): "Each node sends row in routing table to X"
+        # We contribute the row corresponding to the shared prefix length.
+        spl = self._shared_prefix_length(self.node_id, new_id)
+        if spl not in collected_rows:
+            collected_rows[spl] = self._get_routing_table_row(spl)
+
+        hops_path.append(self.node_id)
+
+        # Check if we are the destination (closest node)
+        if self._is_in_leaf_set_range(new_id):
+            closest = self._find_closest_in(new_id, self.leaf_set + [self.node_id])
+            
+            if closest == self.node_id or closest is None or closest in hops_path:
+                return {
+                    'collected_rows': collected_rows,
+                    'leaf_set': (list(self.leaf_smaller), list(self.leaf_larger)),
+                    'z_node': self.node_id,
+                    'hops_path': hops_path,
+                }
+            
+            return self._forward_join(closest, msg, collected_rows, hops_path)
+
+        # Standard Routing Table forwarding
+        if spl < self.num_digits:
+            next_digit = self._get_digit(new_id, spl)
+            entry = self.routing_table[spl][next_digit]
+            if entry is not None and entry != self.node_id and entry not in hops_path:
+                return self._forward_join(entry, msg, collected_rows, hops_path)
+
+        # Rare case fallback (not implemented for join for brevity, rare in stable nets)
+        return { # Fallback: Assume I am Z
+            'collected_rows': collected_rows,
+            'leaf_set': (list(self.leaf_smaller), list(self.leaf_larger)),
+            'z_node': self.node_id,
+            'hops_path': hops_path,
+        }
+
+    def _forward_join(self, next_hop, original_msg, collected, path):
+        """Helper to forward the modified join message."""
+        new_msg = Message(
+            'join_route', src_id=original_msg.src_id, dst_id=next_hop,
+            data={
+                'new_node_id': original_msg.data['new_node_id'],
+                'collected_rows': collected,
+                'hops_path': path,
+            }
         )
-        self.network.send(msg, count_hop=False)
-
-        if hasattr(self.network, 'get_stats'):
-            return self.network.get_stats()['total_hops']
-        return 0
-
-    def delete(self, key: str) -> int:
-        """Delete a key from the DHT. Returns number of hops."""
-        if hasattr(self.network, 'reset_counters'):
-            self.network.reset_counters()
-
-        key_id = hash_key(key, self.m)
-        responsible_node = self.route(key_id)
-
-        msg = Message(
-            msg_type='delete',
-            src_id=self.node_id,
-            dst_id=responsible_node,
-            key=key
-        )
-        self.network.send(msg, count_hop=False)
-
-        if hasattr(self.network, 'get_stats'):
-            return self.network.get_stats()['total_hops']
-        return 0
-
-    def update(self, key: str, value: Any) -> int:
-        """Update a key's value in the DHT. Returns number of hops."""
-        if hasattr(self.network, 'reset_counters'):
-            self.network.reset_counters()
-
-        key_id = hash_key(key, self.m)
-        responsible_node = self.route(key_id)
-
-        msg = Message(
-            msg_type='update',
-            src_id=self.node_id,
-            dst_id=responsible_node,
-            key=key,
-            value=value
-        )
-        self.network.send(msg, count_hop=False)
-
-        if hasattr(self.network, 'get_stats'):
-            return self.network.get_stats()['total_hops']
-        return 0
+        return self.network.send(new_msg)
 
 
 class Pastry(DHT):
-    """Pastry DHT implementation."""
+    """
+    Pastry Network Controller.
+    
+    ACADEMIC NOTE:
+    This class is now 'thin'. It only manages the simulation lifecycle.
+    It delegates logic to PastryNode instances.
+    """
 
     def __init__(self, m: int = 16, b: int = 4):
-        """
-        Initialize Pastry DHT.
-        m: number of bits in identifier space (default 16)
-        b: number of bits per digit (default 4 for base-16)
-        """
         self.m = m
         self.b = b
         self.max_id = 2 ** m
@@ -341,192 +411,110 @@ class Pastry(DHT):
         self.nodes: Dict[int, PastryNode] = {}
 
     def build(self, node_ids: List[int], items: List[Tuple[str, Any]]):
-        """Build Pastry network with given nodes and items."""
-        if not node_ids:
-            raise ValueError("Must provide at least one node")
+        """Bulk-build the network with full knowledge (bootstrapping)."""
+        if not node_ids: raise ValueError("Need nodes")
 
-        # Normalize node IDs
         normalized_ids = set(nid % self.max_id for nid in node_ids)
 
-        # Create all nodes
         for nid in normalized_ids:
-            node = PastryNode(nid, self.m, self.b, self.network, normalized_ids)
-            self.nodes[nid] = node
+            self.nodes[nid] = PastryNode(nid, self.m, self.b, self.network)
 
-        # Insert initial items
-        for key, value in items:
-            self.insert(key, value)
+        for node in self.nodes.values():
+            node._build_leaf_set(normalized_ids)
+            node._build_routing_table(normalized_ids)
 
-    def lookup(self, key: str, source_node: Optional[int] = None) -> Tuple[Optional[Any], int]:
-        """Lookup key in Pastry network."""
-        if not self.nodes:
-            return None, 0
-
-        self.network.reset_counters()
-
-        if source_node is None:
-            source_node = list(self.nodes.keys())[0]
-
-        # Route to responsible node
-        key_id = hash_key(key, self.m)
-        responsible_node = self._route(key_id, source_node)
-
-        # Lookup value
-        msg = Message(
-            msg_type='lookup',
-            src_id=source_node,
-            dst_id=responsible_node,
-            key=key
-        )
-        values = self.network.send(msg, count_hop=False)
-
-        stats = self.network.get_stats()
-        return values, stats['total_hops']
-
-    def insert(self, key: str, value: Any, source_node: Optional[int] = None) -> int:
-        """Insert key-value pair into Pastry network."""
-        if not self.nodes:
-            return 0
-
-        self.network.reset_counters()
-
-        if source_node is None:
-            source_node = list(self.nodes.keys())[0]
-
-        key_id = hash_key(key, self.m)
-        responsible_node = self._route(key_id, source_node)
-
-        msg = Message(
-            msg_type='insert',
-            src_id=source_node,
-            dst_id=responsible_node,
-            key=key,
-            value=value
-        )
-        self.network.send(msg, count_hop=False)
-
-        stats = self.network.get_stats()
-        return stats['total_hops']
-
-    def delete(self, key: str, source_node: Optional[int] = None) -> int:
-        """Delete key from Pastry network."""
-        if not self.nodes:
-            return 0
-
-        self.network.reset_counters()
-
-        if source_node is None:
-            source_node = list(self.nodes.keys())[0]
-
-        key_id = hash_key(key, self.m)
-        responsible_node = self._route(key_id, source_node)
-
-        msg = Message(
-            msg_type='delete',
-            src_id=source_node,
-            dst_id=responsible_node,
-            key=key
-        )
-        self.network.send(msg, count_hop=False)
-
-        stats = self.network.get_stats()
-        return stats['total_hops']
-
-    def update(self, key: str, value: Any, source_node: Optional[int] = None) -> int:
-        """Update key's value in Pastry network."""
-        if not self.nodes:
-            return 0
-
-        self.network.reset_counters()
-
-        if source_node is None:
-            source_node = list(self.nodes.keys())[0]
-
-        key_id = hash_key(key, self.m)
-        responsible_node = self._route(key_id, source_node)
-
-        msg = Message(
-            msg_type='update',
-            src_id=source_node,
-            dst_id=responsible_node,
-            key=key,
-            value=value
-        )
-        self.network.send(msg, count_hop=False)
-
-        stats = self.network.get_stats()
-        return stats['total_hops']
-
-    def _route(self, target_id: int, source_node: int) -> int:
-        """Route from source to node responsible for target_id."""
-        msg = Message(
-            msg_type='route',
-            src_id=source_node,
-            dst_id=source_node,
-            data={'target_id': target_id}
-        )
-        return self.network.send(msg)
+        for k, v in items:
+            self.insert(k, v)
 
     def join(self, new_node_id: int) -> int:
-        """Add new node to Pastry network."""
-        new_node_id = new_node_id % self.max_id
+        """Add a node. Logic is now delegated to the node itself."""
+        new_node_id %= self.max_id
+        if new_node_id in self.nodes: return 0
 
-        if new_node_id in self.nodes:
-            return 0
-
-        self.network.reset_counters()
-
-        # Get current node IDs
-        all_node_ids = set(self.nodes.keys())
-        all_node_ids.add(new_node_id)
-
-        # Create new node
-        new_node = PastryNode(new_node_id, self.m, self.b, self.network, all_node_ids)
+        # Create the node
+        new_node = PastryNode(new_node_id, self.m, self.b, self.network)
         self.nodes[new_node_id] = new_node
 
-        # Rebuild routing structures for all nodes (simplified approach)
-        for nid in self.nodes:
-            self.nodes[nid]._build_routing_structures(all_node_ids)
+        # Bootstrap using any existing node
+        if len(self.nodes) > 1:
+            # Pick a random existing node (not self)
+            bootstrap_id = next(nid for nid in self.nodes if nid != new_node_id)
+            self.network.reset_counters()
+            new_node.bootstrap(bootstrap_id)
+            return self.network.get_stats()['total_hops']
+        return 0
 
-        # Transfer keys to new node if needed
-        # (In a full implementation, we'd transfer keys from nearby nodes)
+    # REFACTOR: Generic Helper for CRUD operations
+    def _dht_op(self, key: str, op: str, value: Any = None) -> Any:
+        if not self.nodes: return None
+        self.network.reset_counters()
+        
+        source_id = next(iter(self.nodes))
+        key_id = hash_key(key, self.m)
+        
+        # Ask source node to route to key owner
+        responsible_id = self.nodes[source_id].route(key_id)
+        
+        # Send actual operation to responsible node
+        msg = Message(op, src_id=source_id, dst_id=responsible_id, key=key, value=value)
+        res = self.network.send(msg, count_hop=False)
+        
+        # For lookups, return result + hops. For others, just hops.
+        hops = self.network.get_stats()['total_hops']
+        return (res, hops) if op == 'lookup' else hops
 
-        stats = self.network.get_stats()
-        return stats['total_hops']
+    def lookup(self, key: str, source_node: Optional[int] = None) -> Tuple[Optional[Any], int]:
+        return self._dht_op(key, 'lookup')
+
+    def insert(self, key: str, value: Any, source_node: Optional[int] = None) -> int:
+        return self._dht_op(key, 'insert', value)
+
+    def delete(self, key: str, source_node: Optional[int] = None) -> int:
+        return self._dht_op(key, 'delete')
+
+    def update(self, key: str, value: Any, source_node: Optional[int] = None) -> int:
+        return self._dht_op(key, 'update', value)
 
     def leave(self, node_id: int, graceful: bool = True) -> int:
-        """Remove node from Pastry network."""
-        node_id = node_id % self.max_id
-
+        node_id %= self.max_id
         if node_id not in self.nodes:
             return 0
 
         self.network.reset_counters()
-        node = self.nodes[node_id]
+        departing = self.nodes[node_id]
 
         if graceful:
-            # Transfer all keys to closest node in leaf set
-            all_items = node.storage.get_all_items()
-            if node.leaf_set:
-                closest = node.leaf_set[0]
-                successor_node = self.nodes[closest]
-                for key, values in all_items:
-                    for value in values:
-                        successor_node.storage.put(key, value)
+            # Transfer each key to the node that will be responsible after departure
+            for key_str, values in departing.storage.get_all_items():
+                key_id = hash_key(key_str, self.m)
+                # Find closest remaining node to this key
+                best_node = None
+                best_dist = self.max_id
+                for nid in departing.leaf_set:
+                    if nid in self.nodes and nid != node_id:
+                        d = departing._circular_distance(key_id, nid)
+                        if d < best_dist or (d == best_dist and (best_node is None or nid < best_node)):
+                            best_dist = d
+                            best_node = nid
+                if best_node and best_node in self.nodes:
+                    for v in values:
+                        self.nodes[best_node].storage.put(key_str, v)
 
-        # Remove node
         self.network.unregister_node(node_id)
         del self.nodes[node_id]
 
-        # Rebuild routing structures
-        if self.nodes:
-            all_node_ids = set(self.nodes.keys())
-            for nid in self.nodes:
-                self.nodes[nid]._build_routing_structures(all_node_ids)
+        # Remove departed node from all remaining nodes' state
+        for nid, node in self.nodes.items():
+            if node_id in node.leaf_smaller:
+                node.leaf_smaller.remove(node_id)
+            if node_id in node.leaf_larger:
+                node.leaf_larger.remove(node_id)
+            for row in range(len(node.routing_table)):
+                for col in range(len(node.routing_table[row])):
+                    if node.routing_table[row][col] == node_id:
+                        node.routing_table[row][col] = None
 
-        stats = self.network.get_stats()
-        return stats['total_hops']
+        return self.network.get_stats()['total_hops']
 
     def get_all_nodes(self) -> List[int]:
-        """Get list of all node IDs."""
         return list(self.nodes.keys())
