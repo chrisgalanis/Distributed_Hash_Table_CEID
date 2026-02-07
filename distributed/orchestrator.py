@@ -317,14 +317,21 @@ def main():
             internal_addresses[node_id] = f"{prefix}-{i}:8000"
 
     elif args.deployment == 'k8s':
-        # Kubernetes: use StatefulSet DNS
-        node_addresses = {}
+        # Kubernetes: orchestrator runs on host, nodes in cluster
+        # Use localhost with different ports (requires port-forwarding)
+        node_addresses = {}  # For orchestrator -> nodes (via kubectl port-forward)
+        internal_addresses = {}  # For node -> node communication (cluster DNS)
         service_name = f"{args.protocol}-node"
+        base_port = 8000 if args.protocol == 'chord' else 9000
+
         for i in range(args.num_nodes):
             node_id = i * 50
             pod_name = f"{service_name}-{i}"
-            address = f"{pod_name}.{service_name}.dht-system.svc.cluster.local:8000"
-            node_addresses[node_id] = address
+            # External address (orchestrator -> node via port-forward)
+            port = base_port + i
+            node_addresses[node_id] = f"localhost:{port}"
+            # Internal address (node -> node inside cluster)
+            internal_addresses[node_id] = f"{pod_name}.{service_name}.dht-system.svc.cluster.local:8000"
 
     else:  # local
         # Local: localhost with different ports
@@ -337,8 +344,8 @@ def main():
 
     logger.info(f"Node addresses: {node_addresses}")
 
-    # Create orchestrator with internal addresses if in Docker mode
-    if args.deployment == 'docker':
+    # Create orchestrator with internal addresses if in Docker/K8s mode
+    if args.deployment in ['docker', 'k8s']:
         logger.info(f"Internal addresses (for nodes): {internal_addresses}")
         orchestrator = DistributedOrchestrator(node_addresses, args.protocol, args.m, internal_addresses)
     else:

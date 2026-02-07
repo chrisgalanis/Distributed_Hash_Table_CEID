@@ -199,18 +199,12 @@ class DHTNodeServer:
                 if self.node is None:
                     return jsonify({'error': 'Node not initialized'}), 500
 
-                # Reset hop counter before operation
-                self.network.reset_counters()
-
-                # Perform lookup
-                values, local_hops = self.node.lookup(key)
-
-                # Get total hops from network
-                stats = self.network.get_stats()
+                # Perform lookup (node handles routing and hop counting)
+                values, hops = self.node.lookup(key)
 
                 return jsonify({
                     'values': self._serialize_value(values),
-                    'hops': stats['total_hops']
+                    'hops': hops
                 })
 
             except Exception as e:
@@ -228,17 +222,11 @@ class DHTNodeServer:
                 if self.node is None:
                     return jsonify({'error': 'Node not initialized'}), 500
 
-                # Reset hop counter
-                self.network.reset_counters()
-
-                # Perform insert
+                # Perform insert (node handles routing and hop counting)
                 hops = self.node.insert(key, value)
 
-                # Get total hops
-                stats = self.network.get_stats()
-
                 return jsonify({
-                    'hops': stats['total_hops'],
+                    'hops': hops,
                     'status': 'inserted'
                 })
 
@@ -256,17 +244,11 @@ class DHTNodeServer:
                 if self.node is None:
                     return jsonify({'error': 'Node not initialized'}), 500
 
-                # Reset hop counter
-                self.network.reset_counters()
-
-                # Perform delete
+                # Perform delete (node handles routing and hop counting)
                 hops = self.node.delete(key)
 
-                # Get total hops
-                stats = self.network.get_stats()
-
                 return jsonify({
-                    'hops': stats['total_hops'],
+                    'hops': hops,
                     'status': 'deleted'
                 })
 
