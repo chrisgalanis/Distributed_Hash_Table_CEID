@@ -32,13 +32,13 @@ def plot_hops_by_nodes(df: pd.DataFrame, output_dir: str = "results"):
         plt.figure(figsize=(10, 6))
 
         # Plot Chord
-        chord_df = op_df[op_df['protocol'] == 'chord']
+        chord_df = op_df[op_df['protocol'] == 'Chord']
         if not chord_df.empty:
             plt.plot(chord_df['num_nodes'], chord_df['avg_hops'],
                     marker='o', label='Chord', linewidth=2, markersize=8)
 
         # Plot Pastry
-        pastry_df = op_df[op_df['protocol'] == 'pastry']
+        pastry_df = op_df[op_df['protocol'] == 'Pastry']
         if not pastry_df.empty:
             plt.plot(pastry_df['num_nodes'], pastry_df['avg_hops'],
                     marker='s', label='Pastry', linewidth=2, markersize=8)
@@ -88,13 +88,13 @@ def plot_all_operations_comparison(df: pd.DataFrame, output_dir: str = "results"
         op_df = df[df['operation'] == operation]
 
         # Plot Chord
-        chord_df = op_df[op_df['protocol'] == 'chord']
+        chord_df = op_df[op_df['protocol'] == 'Chord']
         if not chord_df.empty:
             ax.plot(chord_df['num_nodes'], chord_df['avg_hops'],
                    marker='o', label='Chord', linewidth=2, markersize=6)
 
         # Plot Pastry
-        pastry_df = op_df[op_df['protocol'] == 'pastry']
+        pastry_df = op_df[op_df['protocol'] == 'Pastry']
         if not pastry_df.empty:
             ax.plot(pastry_df['num_nodes'], pastry_df['avg_hops'],
                    marker='s', label='Pastry', linewidth=2, markersize=6)
@@ -139,8 +139,8 @@ def plot_performance_ratio(df: pd.DataFrame, output_dir: str = "results"):
         op_df = df[df['operation'] == operation]
 
         # Get Chord and Pastry data
-        chord_df = op_df[op_df['protocol'] == 'chord'].sort_values('num_nodes')
-        pastry_df = op_df[op_df['protocol'] == 'pastry'].sort_values('num_nodes')
+        chord_df = op_df[op_df['protocol'] == 'Chord'].sort_values('num_nodes')
+        pastry_df = op_df[op_df['protocol'] == 'Pastry'].sort_values('num_nodes')
 
         if len(chord_df) == len(pastry_df):
             ratios = chord_df['avg_hops'].values / (pastry_df['avg_hops'].values + 1e-10)
@@ -178,7 +178,7 @@ def plot_boxplot_comparison(df: pd.DataFrame, output_dir: str = "results"):
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
     # Chord
-    chord_df = plot_df[plot_df['protocol'] == 'chord']
+    chord_df = plot_df[plot_df['protocol'] == 'Chord']
     if not chord_df.empty:
         chord_data = [chord_df[chord_df['operation'] == op]['avg_hops'].values
                       for op in main_ops if op in chord_df['operation'].values]
@@ -189,7 +189,7 @@ def plot_boxplot_comparison(df: pd.DataFrame, output_dir: str = "results"):
         axes[0].grid(True, alpha=0.3)
 
     # Pastry
-    pastry_df = plot_df[plot_df['protocol'] == 'pastry']
+    pastry_df = plot_df[plot_df['protocol'] == 'Pastry']
     if not pastry_df.empty:
         pastry_data = [pastry_df[pastry_df['operation'] == op]['avg_hops'].values
                        for op in main_ops if op in pastry_df['operation'].values]
