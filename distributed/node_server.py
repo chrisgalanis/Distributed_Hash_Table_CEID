@@ -9,8 +9,8 @@ import os
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from dht.chord import ChordNode, FingerEntry
-from dht.pastry import PastryNode
+from dht.chord import Chord, ChordNode, FingerEntry
+from dht.pastry import Pastry, PastryNode
 from dht.common import Message
 from distributed.network_real import DistributedNetwork
 
@@ -39,12 +39,14 @@ class DHTNodeServer:
         # Create network
         self.network = DistributedNetwork()
 
-        # Create DHT node
+        # Create DHT instance and node
         if protocol == "chord":
-            self.node = ChordNode(node_id, m, self.network)
+            self.dht = Chord(m, network=self.network)
+            self.node = ChordNode(node_id, m)
+            self.dht._register_node(self.node)
         elif protocol == "pastry":
-            # For Pastry, we need all nodes to build routing structures
-            # This will be initialized later via /init endpoint
+            self.dht = Pastry(m, b, network=self.network)
+            # Node will be initialized later via /init endpoint
             self.node = None
         else:
             raise ValueError(f"Unknown protocol: {protocol}")
@@ -79,8 +81,7 @@ class DHTNodeServer:
                 # Handle message
                 if self.node is None:
                     return jsonify({'error': 'Node not initialized'}), 500
-
-                result = self.node.handle_message(msg)
+                result = self.dht._handle_message(self.node_id, msg)
 
                 # Serialize result
                 return jsonify({'result': self._serialize_value(result)})
@@ -116,8 +117,10 @@ class DHTNodeServer:
                 elif self.protocol == "pastry":
                     # Initialize Pastry node with all nodes
                     all_nodes = set(data.get('all_nodes', []))
-                    self.node = PastryNode(self.node_id, self.m, self.b,
-                                          self.network, all_nodes)
+                    self.node = PastryNode(self.node_id, self.m, self.b)
+                    self.dht._register_node(self.node)
+                    self.dht._build_leaf_set(self.node, all_nodes)
+                    self.dht._build_routing_table(self.node, all_nodes)
 
                 # Register other nodes in network
                 node_registry = data.get('node_registry', {})
@@ -198,9 +201,7 @@ class DHTNodeServer:
 
                 if self.node is None:
                     return jsonify({'error': 'Node not initialized'}), 500
-
-                # Perform lookup (node handles routing and hop counting)
-                values, hops = self.node.lookup(key)
+                values, hops = self.dht.lookup(key, self.node_id)
 
                 return jsonify({
                     'values': self._serialize_value(values),
@@ -221,9 +222,7 @@ class DHTNodeServer:
 
                 if self.node is None:
                     return jsonify({'error': 'Node not initialized'}), 500
-
-                # Perform insert (node handles routing and hop counting)
-                hops = self.node.insert(key, value)
+                hops = self.dht.insert(key, value, self.node_id)
 
                 return jsonify({
                     'hops': hops,
@@ -243,9 +242,7 @@ class DHTNodeServer:
 
                 if self.node is None:
                     return jsonify({'error': 'Node not initialized'}), 500
-
-                # Perform delete (node handles routing and hop counting)
-                hops = self.node.delete(key)
+                hops = self.dht.delete(key, self.node_id)
 
                 return jsonify({
                     'hops': hops,

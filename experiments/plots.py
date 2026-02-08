@@ -218,6 +218,9 @@ def generate_all_plots(csv_file: str, output_dir: str = "results"):
 
     df = load_results(csv_file)
 
+    # Normalize protocol names to lowercase for consistent filtering
+    df['protocol'] = df['protocol'].str.lower()
+
     print(f"Loaded {len(df)} result rows")
 
     # Generate all plots

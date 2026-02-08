@@ -18,13 +18,12 @@ class FingerEntry:
 
 
 class ChordNode:
-    """A node in the Chord DHT ring."""
+    """A node in the Chord DHT ring - holds identity and state data only."""
 
-    def __init__(self, node_id: int, m: int, network: NetworkSimulator):
+    def __init__(self, node_id: int, m: int):
         self.node_id = node_id
         self.m = m  # Number of bits in identifier space
         self.max_id = 2 ** m
-        self.network = network
 
         # Chord routing state
         self.successor: Optional[int] = None
@@ -40,104 +39,102 @@ class ChordNode:
         # Local storage
         self.storage = LocalStorage(use_btree=True)
 
-        # Register with network (only for NetworkSimulator, not DistributedNetwork)
-        # DistributedNetwork uses addresses, not handlers
-        if hasattr(network, 'nodes'):  # NetworkSimulator has 'nodes' attribute (dict of handlers)
-            network.register_node(node_id, self.handle_message)
 
-    def handle_message(self, msg: Message) -> Any:
-        """Handle incoming messages."""
+class Chord(DHT):
+    """Chord DHT implementation."""
+
+    def __init__(self, m: int = 16, network=None):
+        """
+        Initialize Chord DHT.
+        m: number of bits in identifier space (default 16 -> max 65536 nodes)
+        network: optional network layer (defaults to NetworkSimulator)
+        """
+        self.m = m
+        self.max_id = 2 ** m
+        self.network = network or NetworkSimulator()
+        self.nodes: Dict[int, ChordNode] = {}
+
+    def _register_node(self, node: ChordNode):
+        """Register a node with the network for message handling."""
+        self.nodes[node.node_id] = node
+        # Only register handler for NetworkSimulator, not DistributedNetwork
+        # NetworkSimulator has 'nodes' attribute (dict of handlers)
+        if hasattr(self.network, 'nodes'):
+            self.network.register_node(
+                node.node_id,
+                lambda msg, nid=node.node_id: self._handle_message(nid, msg)
+            )
+
+    def _handle_message(self, node_id: int, msg: Message) -> Any:
+        """Handle incoming messages for a specific node."""
+        node = self.nodes[node_id]
         if msg.msg_type == 'find_successor':
             target_id = msg.data['target_id']
-            return self._find_successor_handler(target_id)
+            return self._find_successor_for_node(node, target_id)
         elif msg.msg_type == 'get_predecessor':
-            return self.predecessor
+            return node.predecessor
         elif msg.msg_type == 'get_successor':
-            return self.successor
+            return node.successor
         elif msg.msg_type == 'notify':
             # Stabilization: potential predecessor is notifying us to update them
             potential_pred = msg.data.get('node_id')
-            self._notify(potential_pred)
+            self._notify(node, potential_pred)
             return True
         elif msg.msg_type == 'lookup':
-            return self.storage.get(msg.key)
+            return node.storage.get(msg.key)
         elif msg.msg_type == 'insert':
-            self.storage.put(msg.key, msg.value)
+            node.storage.put(msg.key, msg.value)
             return True
         elif msg.msg_type == 'delete':
-            self.storage.delete(msg.key)
+            node.storage.delete(msg.key)
             return True
         elif msg.msg_type == 'update':
-            self.storage.update(msg.key, msg.value)
+            node.storage.update(msg.key, msg.value)
             return True
         elif msg.msg_type == 'get_all_keys':
-            return self.storage.get_all_keys()
+            return node.storage.get_all_keys()
         elif msg.msg_type == 'get_all_items':
-            return self.storage.get_all_items()
+            return node.storage.get_all_items()
         elif msg.msg_type == 'transfer_keys':
             # Transfer keys in a range to another node
             start = msg.data.get('start')
             end = msg.data.get('end')
-            return self._transfer_keys(start, end)
+            return self._transfer_keys(node, start, end)
         else:
             return None
 
-    def find_successor(self, target_id: int) -> int:
-        """
-        Public method to find successor of target_id.
-        Initiates routing through the DHT.
-        """
+    def _find_successor_for_node(self, node: ChordNode, target_id: int) -> int:
+        """Find successor of target_id from a node's perspective."""
         # If target is between us and our successor, return successor
-        if self.successor and self._in_range(target_id, self.node_id, self.successor, inclusive_end=True):
-            return self.successor
-
-        # Otherwise, find closest preceding node and forward
-        closest = self._closest_preceding_node(target_id)
-
-        if closest == self.node_id:
-            # We are the closest, return our successor
-            return self.successor if self.successor else self.node_id
-
-        # Forward to closest node
-        msg = Message(
-            msg_type='find_successor',
-            src_id=self.node_id,
-            dst_id=closest,
-            data={'target_id': target_id}
-        )
-        return self.network.send(msg)
-
-    def _find_successor_handler(self, target_id: int) -> int:
-        """Find successor of target_id."""
-        # If target is between us and our successor, return successor
-        if self._in_range(target_id, self.node_id, self.successor, inclusive_end=True):
-            return self.successor
+        if self._in_range(target_id, node.node_id, node.successor, inclusive_end=True):
+            return node.successor
 
         # Otherwise, forward to closest preceding node
-        closest = self._closest_preceding_node(target_id)
-        if closest == self.node_id:
-            return self.successor
+        closest = self._closest_preceding_node(node, target_id)
+        if closest == node.node_id:
+            return node.successor
 
         # Forward request
         msg = Message(
             msg_type='find_successor',
-            src_id=self.node_id,
+            src_id=node.node_id,
             dst_id=closest,
             data={'target_id': target_id}
         )
         return self.network.send(msg)
 
-    def _closest_preceding_node(self, target_id: int) -> int:
-        """Find closest node preceding target_id."""
+    def _closest_preceding_node(self, node: ChordNode, target_id: int) -> int:
+        """Find closest node preceding target_id in the node's finger table."""
         # Check finger table in reverse order (largest jumps first)
-        for i in range(self.m - 1, -1, -1):
-            finger_node = self.finger_table[i].node
-            if finger_node is not None and self._in_range(finger_node, self.node_id, target_id, inclusive_start=False, inclusive_end=False):
+        for i in range(node.m - 1, -1, -1):
+            finger_node = node.finger_table[i].node
+            if finger_node is not None and self._in_range(finger_node, node.node_id, target_id, inclusive_start=False, inclusive_end=False):
                 return finger_node
 
-        return self.node_id
+        return node.node_id
 
-    def _in_range(self, val: int, start: int, end: int,
+    @staticmethod
+    def _in_range(val: int, start: int, end: int,
                   inclusive_start: bool = False, inclusive_end: bool = False) -> bool:
         """Check if val is in the circular range (start, end)."""
         if start == end:
@@ -162,87 +159,92 @@ class ChordNode:
             else:
                 return val > start or val < end
 
-    def _transfer_keys(self, start: int, end: int) -> List[Tuple[str, List[Any]]]:
-        """Transfer keys in range (start, end] to another node."""
+    def _transfer_keys(self, node: ChordNode, start: int, end: int) -> List[Tuple[str, List[Any]]]:
+        """Transfer keys in range (start, end] from a node."""
         items_to_transfer = []
         keys_to_remove = []
 
-        for key in self.storage.get_all_keys():
-            key_id = hash_key(key, self.m)
+        for key in node.storage.get_all_keys():
+            key_id = hash_key(key, node.m)
             if self._in_range(key_id, start, end, inclusive_end=True):
-                values = self.storage.get(key)
+                values = node.storage.get(key)
                 items_to_transfer.append((key, values))
                 keys_to_remove.append(key)
 
         # Remove transferred keys
         for key in keys_to_remove:
-            self.storage.delete(key)
+            node.storage.delete(key)
 
         return items_to_transfer
 
     #in theory its called periodically to verify our successor and notify him
-    def stabilize(self) -> bool:
+    def stabilize(self, node_id: int) -> bool:
+        """Run stabilization for a specific node."""
         # ask our successor for his predecessor (x)
         #   If x is between us and our current successor, we should make x our new successor
         #   Then we must notify our new successor about us
-        if self.successor is None:
+        node = self.nodes[node_id]
+        if node.successor is None:
             return False
 
         # Get predecessor of our successor
         msg = Message(
             msg_type='get_predecessor',
-            src_id=self.node_id,
-            dst_id=self.successor
+            src_id=node.node_id,
+            dst_id=node.successor
         )
         x = self.network.send(msg, count_hop=False)
 
         updated = False
         # If x exists and is in interval (self, successor), update successor
-        if x is not None and x != self.node_id and x != self.successor:
-            if self._in_range(x, self.node_id, self.successor,
+        if x is not None and x != node.node_id and x != node.successor:
+            if self._in_range(x, node.node_id, node.successor,
                               inclusive_start=False, inclusive_end=False):
-                self.successor = x
+                node.successor = x
                 # Update first finger table entry to match
-                self.finger_table[0].node = x
+                node.finger_table[0].node = x
                 updated = True
 
         # Notify our successor about us (we might be its predecessor)
         msg = Message(
             msg_type='notify',
-            src_id=self.node_id,
-            dst_id=self.successor,
-            data={'node_id': self.node_id}
+            src_id=node.node_id,
+            dst_id=node.successor,
+            data={'node_id': node.node_id}
         )
         self.network.send(msg, count_hop=False)
 
         return updated
 
     #called when a node thinks it might be our predecessor
-    def _notify(self, potential_predecessor: int):
+    def _notify(self, node: ChordNode, potential_predecessor: int):
+        """Handle notification that a node might be our predecessor."""
         #If a node thinks he is our new predecessor we:
         # 1. IF we already have one
         # 2. IF he is between our current predecessor and us, then we MUST update him as our new predecessor
         if potential_predecessor is None:
             return
 
-        if self.predecessor is None:
-            self.predecessor = potential_predecessor
-        elif self._in_range(potential_predecessor, self.predecessor, self.node_id,
+        if node.predecessor is None:
+            node.predecessor = potential_predecessor
+        elif self._in_range(potential_predecessor, node.predecessor, node.node_id,
                             inclusive_start=False, inclusive_end=False):
-            self.predecessor = potential_predecessor
+            node.predecessor = potential_predecessor
 
-    def fix_finger(self, i: int) -> bool:
-        if i < 0 or i >= self.m:
+    def fix_finger(self, node_id: int, i: int) -> bool:
+        """Fix finger table entry i for a specific node."""
+        node = self.nodes[node_id]
+        if i < 0 or i >= node.m:
             return False
 
-        finger_entry = self.finger_table[i]
+        finger_entry = node.finger_table[i]
         old_node = finger_entry.node
 
         # Find successor of finger[i].start
         msg = Message(
             msg_type='find_successor',
-            src_id=self.node_id,
-            dst_id=self.node_id,
+            src_id=node.node_id,
+            dst_id=node.node_id,
             data={'target_id': finger_entry.start}
         )
         new_node = self.network.send(msg, count_hop=False)
@@ -250,128 +252,9 @@ class ChordNode:
 
         # Keep successor in sync with finger[0]
         if i == 0:
-            self.successor = new_node
+            node.successor = new_node
 
         return old_node != new_node
-
-    # High-level DHT operations (for both simulated and distributed modes)
-    def lookup(self, key: str) -> Tuple[Optional[List[Any]], int]:
-        """
-        Lookup a key in the DHT.
-        Returns (values, hops) tuple.
-        """
-        # Reset hop counter if we have access to it
-        if hasattr(self.network, 'reset_counters'):
-            self.network.reset_counters()
-
-        # Hash the key to get ID
-        key_id = hash_key(key, self.m)
-
-        # Find responsible node
-        responsible_node = self.find_successor(key_id)
-
-        # Send lookup message
-        msg = Message(
-            msg_type='lookup',
-            src_id=self.node_id,
-            dst_id=responsible_node,
-            key=key
-        )
-        values = self.network.send(msg, count_hop=False)  # Don't count the final data retrieval
-
-        # Get hop count
-        if hasattr(self.network, 'get_stats'):
-            stats = self.network.get_stats()
-            hops = stats['total_hops']
-        else:
-            hops = 0
-
-        return values, hops
-
-    def insert(self, key: str, value: Any) -> int:
-        """
-        Insert a key-value pair into the DHT.
-        Returns number of hops.
-        """
-        if hasattr(self.network, 'reset_counters'):
-            self.network.reset_counters()
-
-        key_id = hash_key(key, self.m)
-        responsible_node = self.find_successor(key_id)
-
-        msg = Message(
-            msg_type='insert',
-            src_id=self.node_id,
-            dst_id=responsible_node,
-            key=key,
-            value=value
-        )
-        self.network.send(msg, count_hop=False)
-
-        if hasattr(self.network, 'get_stats'):
-            return self.network.get_stats()['total_hops']
-        return 0
-
-    def delete(self, key: str) -> int:
-        """
-        Delete a key from the DHT.
-        Returns number of hops.
-        """
-        if hasattr(self.network, 'reset_counters'):
-            self.network.reset_counters()
-
-        key_id = hash_key(key, self.m)
-        responsible_node = self.find_successor(key_id)
-
-        msg = Message(
-            msg_type='delete',
-            src_id=self.node_id,
-            dst_id=responsible_node,
-            key=key
-        )
-        self.network.send(msg, count_hop=False)
-
-        if hasattr(self.network, 'get_stats'):
-            return self.network.get_stats()['total_hops']
-        return 0
-
-    def update(self, key: str, value: Any) -> int:
-        """
-        Update a key's value in the DHT.
-        Returns number of hops.
-        """
-        if hasattr(self.network, 'reset_counters'):
-            self.network.reset_counters()
-
-        key_id = hash_key(key, self.m)
-        responsible_node = self.find_successor(key_id)
-
-        msg = Message(
-            msg_type='update',
-            src_id=self.node_id,
-            dst_id=responsible_node,
-            key=key,
-            value=value
-        )
-        self.network.send(msg, count_hop=False)
-
-        if hasattr(self.network, 'get_stats'):
-            return self.network.get_stats()['total_hops']
-        return 0
-
-
-class Chord(DHT):
-    """Chord DHT implementation."""
-
-    def __init__(self, m: int = 16):
-        """
-        Initialize Chord DHT.
-        m: number of bits in identifier space (default 16 -> max 65536 nodes)
-        """
-        self.m = m
-        self.max_id = 2 ** m
-        self.network = NetworkSimulator()
-        self.nodes: Dict[int, ChordNode] = {}
 
     def build(self, node_ids: List[int], items: List[Tuple[str, Any]]):
         """Build the Chord ring with given nodes and items."""
@@ -380,8 +263,8 @@ class Chord(DHT):
 
         # Create nodes
         for nid in node_ids:
-            node = ChordNode(nid % self.max_id, self.m, self.network)
-            self.nodes[nid % self.max_id] = node
+            node = ChordNode(nid % self.max_id, self.m)
+            self._register_node(node)
 
         # Sort nodes by ID
         sorted_nodes = sorted(self.nodes.keys())
@@ -534,17 +417,22 @@ class Chord(DHT):
         self.network.reset_counters()
 
         # Create new node
-        new_node = ChordNode(new_node_id, self.m, self.network)
+        new_node = ChordNode(new_node_id, self.m)
 
         if not self.nodes:
             # First node
             new_node.successor = new_node_id
             new_node.predecessor = new_node_id
-            self.nodes[new_node_id] = new_node
+            self._register_node(new_node)
             return 0
 
-        # Find successor of new node
+        # Pick an existing node before registering the new one
         arbitrary_node = list(self.nodes.keys())[0]
+
+        # Register new node so it can receive messages during routing
+        self._register_node(new_node)
+
+        # Find successor of new node
         successor = self._find_successor(new_node_id, arbitrary_node)
 
         # Get predecessor of successor - this is a bit off-paper implementation, usually this is handled by the stabilization but it just made more sense (as seen from sioutas lecture) to copy the predecessor from new node's successor.
@@ -560,9 +448,6 @@ class Chord(DHT):
 
         # Update successor's predecessor
         self.nodes[successor].predecessor = new_node_id
-
-        # Add node to network
-        self.nodes[new_node_id] = new_node
 
         # Rebuild finger tables for simplicity
         self._rebuild_fingers()
@@ -637,13 +522,13 @@ class Chord(DHT):
         #runs multiple rounds of stabilize and fix_finger
         for _ in range(rounds):
             # Run stabilize on all nodes
-            for node in self.nodes.values():
-                node.stabilize()
+            for node_id in self.nodes:
+                self.stabilize(node_id)
 
         # Fix all finger table entries
-        for node in self.nodes.values():
+        for node_id in self.nodes:
             for i in range(self.m):
-                node.fix_finger(i)
+                self.fix_finger(node_id, i)
 
     def get_all_nodes(self) -> List[int]:
         """Get list of all node IDs."""
